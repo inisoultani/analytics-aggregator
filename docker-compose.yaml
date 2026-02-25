@@ -1,0 +1,30 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: analytics_aggregator_db
+    environment:
+      POSTGRES_USER: analytics
+      POSTGRES_PASSWORD: analytics
+      POSTGRES_DB: analytics_aggregator
+    command:
+      - "postgres"
+      - "-c"
+      - "log_statement=all" # Logs every SQL query
+      - "-c"
+      - "log_duration=on" # Logs how long each query took
+      - "-c"
+      - "log_line_prefix='%m [%p] '" # Adds timestamp and process ID
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Map local migration file to the auto-init directory
+      - ./db/migrations/001_init.up.sql:/docker-entrypoint-initdb.d/001_init.up.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgdata:
