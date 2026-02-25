@@ -9,7 +9,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 )
 
-func NewRouter(aar *service.AnalyticsAggregatorService, cfg *config.Config) http.Handler {
+func NewRouter(ps *service.PipelineService, cfg *config.Config) http.Handler {
 	r := chi.NewRouter()
 
 	r.Use(middleware.Recoverer)
@@ -23,7 +23,7 @@ func NewRouter(aar *service.AnalyticsAggregatorService, cfg *config.Config) http
 	})
 
 	r.Route("/event", func(r chi.Router) {
-		h := NewHandler(aar, cfg)
+		h := NewHandler(ps, cfg)
 
 		r.Post("/", h.MakeHandler(h.ProcessAndStoreEvents))
 		// r.Get("/{loanID}", h.MakeHandler(h.GetLoanByID))

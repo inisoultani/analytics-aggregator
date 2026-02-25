@@ -54,7 +54,7 @@ func main() {
 
 	// initate core
 	txManager := repository.NewPostgresTxManager(pool)
-	service := service.NewAnalyticsAggregatorService(txManager)
+	service := service.NewPipelineService(txManager)
 
 	// initiate app
 	addr := ":" + cfg.ServerPort

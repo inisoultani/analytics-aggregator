@@ -11,14 +11,14 @@ import (
 type HandlerFunc func(w http.ResponseWriter, r *http.Request) error
 
 type Handler struct {
-	aar    *service.AnalyticsAggregatorService
-	config *config.Config
+	service *service.PipelineService
+	config  *config.Config
 }
 
-func NewHandler(aar *service.AnalyticsAggregatorService, cfg *config.Config) *Handler {
+func NewHandler(s *service.PipelineService, cfg *config.Config) *Handler {
 	return &Handler{
-		aar:    aar,
-		config: cfg,
+		service: s,
+		config:  cfg,
 	}
 }
 

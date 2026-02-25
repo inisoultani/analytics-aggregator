@@ -4,24 +4,26 @@ import (
 	"analytics-aggregator/internal/core/domain"
 	"analytics-aggregator/internal/core/port"
 	"context"
+	"log/slog"
 )
 
-type AnalyticsAggregatorService struct {
+type PipelineService struct {
 	txManager port.TxManager
 }
 
-func NewAnalyticsAggregatorService(txManager port.TxManager) *AnalyticsAggregatorService {
-	return &AnalyticsAggregatorService{
+func NewPipelineService(txManager port.TxManager) *PipelineService {
+	return &PipelineService{
 		txManager: txManager,
 	}
 }
 
-func (a *AnalyticsAggregatorService) ProcessAndStore(ctx context.Context, events []domain.Event) (int64, error) {
+func (a *PipelineService) ProcessAndStore(ctx context.Context, events []domain.Event) (int64, error) {
 	recs := int64(0)
 	err := a.txManager.WithTx(ctx, func(aar port.AnalyticsAggregatorRepository) error {
 
 		affectedRecs, err := aar.Event().CreateEvents(ctx, events)
 		if err != nil {
+			slog.Error("create events error", slog.Any("err", err))
 			return err
 		}
 

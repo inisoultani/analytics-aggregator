@@ -15,7 +15,8 @@ import (
 
 func NewPostgresTxManager(pool *pgxpool.Pool) *PostgresTxManager {
 	return &PostgresTxManager{
-		pool: pool,
+		pool:    pool,
+		queries: sqlc.New(pool),
 	}
 }
 
@@ -63,7 +64,7 @@ func getContextWithTimeout(ctx context.Context, label string, rowCount int) (con
 		timeout = 10 * time.Second
 	}
 
-	cause := fmt.Errorf("repo-timeout : %s limit was (%v)", label, timeout)
+	cause := fmt.Errorf("repo_timeout : %s limit was (%v)", label, timeout)
 	return context.WithTimeoutCause(ctx, timeout, cause)
 }
 
