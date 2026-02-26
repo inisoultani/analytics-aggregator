@@ -22,6 +22,7 @@ type PipelineService struct {
 	wgBatch          sync.WaitGroup
 	wgStoreRetry     sync.WaitGroup
 	wgJobDistributor sync.WaitGroup
+	insertBatchSize  int
 }
 
 func NewPipelineService(ctx context.Context, txManager port.TxManager, de port.DataEnricher, cfg *config.Config) *PipelineService {
@@ -32,7 +33,8 @@ func NewPipelineService(ctx context.Context, txManager port.TxManager, de port.D
 		enrichWorkers:   make([]*EnricherWorker, cfg.EnricherWorkerNum),
 		workerPoolChan:  make(chan *EnricherWorker, cfg.EnricherWorkerNum),
 		batchChan:       make(chan *domain.Event),
-		pipelineJobChan: make(chan *domain.Event),
+		pipelineJobChan: make(chan *domain.Event, 10),
+		insertBatchSize: cfg.InsertBatchSize,
 	}
 	// initiating workers during service initiation
 	for i := range cfg.EnricherWorkerNum {
@@ -92,7 +94,9 @@ func (p *PipelineService) storeWithRetry(ctx context.Context, e *domain.Event, w
 func (p *PipelineService) jobDistributor(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
 
-	time.Sleep(10 * time.Second)
+	slog.Info("Initiating job distributor...")
+
+	// time.Sleep(10 * time.Second)
 	for {
 		select {
 		case e, ok := <-p.pipelineJobChan:
@@ -113,7 +117,7 @@ func (p *PipelineService) jobDistributor(ctx context.Context, wg *sync.WaitGroup
 func (p *PipelineService) assignWorker(e *domain.Event) {
 	// defer wg.Done()
 
-	time.Sleep(8 * time.Second)
+	time.Sleep(1 * time.Second)
 	slog.Debug("assignWorker processing event",
 		slog.Any("event", e),
 	)
@@ -124,27 +128,35 @@ func (p *PipelineService) assignWorker(e *domain.Event) {
 func (p *PipelineService) batchInsert(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
 
-	ticker := time.NewTicker(500 * time.Millisecond)
+	ticker := time.NewTicker(3000 * time.Millisecond)
 	slog.Info("Initiating batchInsert with ticker...",
 		slog.Any("ticker", ticker),
 	)
 
+	events := make([]domain.Event, 0)
 	for {
 		select {
 		case <-ticker.C:
-			events := make([]domain.Event, 0)
-			select {
-			case e, ok := <-p.batchChan:
-				if !ok {
-					slog.Info("Batch channel in pipeline is closed...")
-					ticker.Stop()
-					return
-				}
-				events = append(events, *e)
-				slog.Debug("trigger batch insert")
+			if len(events) > 0 {
+				slog.Debug("trigger batch insert via timer ticker")
 				p.insertEvents(ctx, events)
-			default:
-				slog.Debug("no data in the batch channel")
+				clear(events)
+				events = events[:0]
+			} else {
+				slog.Debug("no data exist during timer tick")
+			}
+		case e, ok := <-p.batchChan:
+			if !ok {
+				slog.Info("Batch channel in pipeline is closed...")
+				ticker.Stop()
+				return
+			}
+			events = append(events, *e)
+			if len(events) >= p.insertBatchSize {
+				slog.Debug("trigger batch insert via max size")
+				p.insertEvents(ctx, events)
+				clear(events)
+				events = events[:0]
 			}
 		case <-ctx.Done():
 			slog.Debug("batchInsert mechanism interrupted",
@@ -232,7 +244,7 @@ func (e *EnricherWorker) DataEnricherProcess(ctx context.Context, id int, batchC
 
 	inPool := false
 	for {
-		if !inPool {
+		if !inPool  {
 			select {
 			case workerPool <- e:
 				inPool = true

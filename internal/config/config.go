@@ -24,6 +24,7 @@ type Config struct {
 	LogLevel           *slog.LevelVar
 	GeoAPIBaseURL      string
 	EnricherWorkerNum  int
+	InsertBatchSize    int
 }
 
 func Load() (*Config, error) {
@@ -49,6 +50,7 @@ func Load() (*Config, error) {
 		AppEnv:             strings.ToLower(getEnv("APP_ENV", "development")),
 		GeoAPIBaseURL:      getEnv("GEO_API_BASE_URL", "http://ip-api.com"),
 		EnricherWorkerNum:  getEnvInt("ENRICHER_WORKER_NUM", 2),
+		InsertBatchSize:    getEnvInt("INSERT_BATCH_SIZE", 5),
 	}, nil
 }
 
