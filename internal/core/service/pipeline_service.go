@@ -5,6 +5,7 @@ import (
 	"analytics-aggregator/internal/core/domain"
 	"analytics-aggregator/internal/core/port"
 	"context"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -42,14 +43,13 @@ func NewPipelineService(ctx context.Context, txManager port.TxManager, de port.D
 			cancelFunc:        workerCancelFunc,
 		}
 		s.enrichWorkers[i] = w
-		s.workerPoolChan <- w
 		s.wgWorker.Add(1)
-		go w.DataEnricherProcess(workerCtx, i, s.batchChan, &s.wgWorker)
+		go w.DataEnricherProcess(workerCtx, i, s.batchChan, s.workerPoolChan, &s.wgWorker)
 	}
 
 	// initiating job distributor
 	s.wgJobDistributor.Add(1)
-	go s.jobDistributor(ctx)
+	go s.jobDistributor(ctx, &s.wgJobDistributor)
 
 	// initiating batch process
 	s.wgBatch.Add(1)
@@ -58,32 +58,6 @@ func NewPipelineService(ctx context.Context, txManager port.TxManager, de port.D
 }
 
 func (p *PipelineService) ProcessAndStore(ctx context.Context, e *domain.Event) (int64, error) {
-
-	// for i := range events {
-	// 	enrichData, err := p.dataEnricher.EnrichIp(ctx, events[i].ClientIP)
-	// 	if err != nil {
-	// 		slog.Error("Failed to fetch enrich data",
-	// 			slog.String("event_id", events[i].ID.String()),
-	// 			slog.String("client_ip", events[i].ClientIP),
-	// 			slog.Any("err", err))
-	// 	} else {
-	// 		events[i].EnrichedData = enrichData
-	// 	}
-	// }
-
-	// recs := int64(0)
-	// err := p.txManager.WithTx(ctx, func(aar port.AnalyticsAggregatorRepository) error {
-
-	// 	affectedRecs, err := aar.Event().CreateEvents(ctx, events)
-	// 	if err != nil {
-	// 		slog.Error("create events error", slog.Any("err", err))
-	// 		return err
-	// 	}
-
-	// 	recs = affectedRecs
-	// 	return nil
-	// })
-	// max_retry:
 	p.wgStoreRetry.Add(1)
 	ctx = context.WithoutCancel(ctx)
 	go p.storeWithRetry(ctx, e, &p.wgStoreRetry)
@@ -115,8 +89,8 @@ func (p *PipelineService) storeWithRetry(ctx context.Context, e *domain.Event, w
 	}
 }
 
-func (p *PipelineService) jobDistributor(ctx context.Context) {
-	defer p.wgJobDistributor.Done()
+func (p *PipelineService) jobDistributor(ctx context.Context, wg *sync.WaitGroup) {
+	defer wg.Done()
 
 	time.Sleep(10 * time.Second)
 	for {
@@ -128,7 +102,7 @@ func (p *PipelineService) jobDistributor(ctx context.Context) {
 				)
 				return
 			}
-			p.assignWorker(ctx, e, &p.wgWorker)
+			p.assignWorker(e)
 		case <-ctx.Done():
 			slog.Debug("jobDistributor mechanism interrupted",
 				slog.Any("err", context.Cause(ctx)))
@@ -136,8 +110,8 @@ func (p *PipelineService) jobDistributor(ctx context.Context) {
 	}
 }
 
-func (p *PipelineService) assignWorker(ctx context.Context, e *domain.Event, wg *sync.WaitGroup) {
-	defer wg.Done()
+func (p *PipelineService) assignWorker(e *domain.Event) {
+	// defer wg.Done()
 
 	time.Sleep(8 * time.Second)
 	slog.Debug("assignWorker processing event",
@@ -163,6 +137,7 @@ func (p *PipelineService) batchInsert(ctx context.Context, wg *sync.WaitGroup) {
 			case e, ok := <-p.batchChan:
 				if !ok {
 					slog.Info("Batch channel in pipeline is closed...")
+					ticker.Stop()
 					return
 				}
 				events = append(events, *e)
@@ -176,6 +151,7 @@ func (p *PipelineService) batchInsert(ctx context.Context, wg *sync.WaitGroup) {
 				slog.Any("err", context.Cause(ctx)))
 		}
 	}
+
 }
 
 func (p *PipelineService) insertEvents(ctx context.Context, events []domain.Event) {
@@ -201,19 +177,73 @@ func (p *PipelineService) insertEvents(ctx context.Context, events []domain.Even
 	}
 }
 
+func (p *PipelineService) Close() {
+	// close pipeline job
+	close(p.pipelineJobChan)
+	slog.Debug("close pipelineJobChan DONE")
+
+	// wait all of ongoing storeWithRetry
+	p.wgStoreRetry.Wait()
+	slog.Debug("p.wgStoreRetry.Wait DONE")
+
+	// wait ongoing job distributor process
+	p.wgJobDistributor.Wait()
+	slog.Debug("p.wgJobDistributor.Wait DONE")
+
+	close(p.workerPoolChan)
+	slog.Debug("close workerPoolChan DONE")
+
+	// draining worker pool, close  job channel and terminate each worker
+	for ew := range p.workerPoolChan {
+		close(ew.jobChan)
+		ew.cancelFunc(fmt.Errorf("shutdown pipeline"))
+	}
+	slog.Debug("draining workerPoolChan DONE")
+
+	// close(p.workerPoolChan)
+	// slog.Debug("close workerPoolChan DONE")
+
+	// wait all worker to be terminated
+	p.wgWorker.Wait()
+	slog.Debug("p.wgWorker.Wait DONE")
+
+	// close batch channel & will trigger ticker to stop
+	close(p.batchChan)
+	slog.Debug("close batchChan DONE")
+
+	// wait batch process to terminated
+	p.wgBatch.Wait()
+	slog.Debug("p.wgBatch.Wait DONE")
+
+}
+
 type EnricherWorker struct {
 	jobChan           chan *domain.Event
 	enrichmentService port.DataEnricher
 	cancelFunc        context.CancelCauseFunc
 }
 
-func (e *EnricherWorker) DataEnricherProcess(ctx context.Context, id int, batchChan chan<- *domain.Event, wg *sync.WaitGroup) {
+func (e *EnricherWorker) DataEnricherProcess(ctx context.Context, id int, batchChan chan<- *domain.Event, workerPool chan<- *EnricherWorker, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	slog.Info("EnricherWorker initiating",
 		slog.Int("id", id),
 	)
+
+	inPool := false
 	for {
+		if !inPool {
+			select {
+			case workerPool <- e:
+				inPool = true
+			case <-ctx.Done():
+				slog.Info("EnricherWorker interrupted during entering workerPool",
+					slog.Int("id", id),
+					slog.Any("caused_by", context.Cause(ctx)),
+				)
+			}
+		}
+
 		select {
 		case event, ok := <-e.jobChan:
 			if !ok {
@@ -240,6 +270,7 @@ func (e *EnricherWorker) DataEnricherProcess(ctx context.Context, id int, batchC
 				slog.Duration("duration", time.Since(start)),
 			)
 			batchChan <- event
+			inPool = false
 		case <-time.After(5 * time.Second):
 			slog.Debug("EnricherWorker done sleeping, still waiting for job...",
 				slog.Int("id", id),

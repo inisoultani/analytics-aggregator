@@ -78,6 +78,10 @@ func main() {
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	<-stop
 
+	// close all channel pipeline
+	logger.Info("closing all channel in the pipeline...")
+	service.Close()
+
 	logger.Info("closing all db connections...")
 	pool.Close()
 
