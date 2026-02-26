@@ -2,6 +2,7 @@ package main
 
 import (
 	"analytics-aggregator/internal/adapter/db"
+	"analytics-aggregator/internal/adapter/extapi"
 	"analytics-aggregator/internal/adapter/handler"
 	"analytics-aggregator/internal/adapter/repository"
 	"analytics-aggregator/internal/config"
@@ -54,7 +55,8 @@ func main() {
 
 	// initate core
 	txManager := repository.NewPostgresTxManager(pool)
-	service := service.NewPipelineService(txManager)
+	geoApiClient := extapi.NewGeoAPIClient(cfg.GeoAPIBaseURL)
+	service := service.NewPipelineService(txManager, geoApiClient)
 
 	// initiate app
 	addr := ":" + cfg.ServerPort

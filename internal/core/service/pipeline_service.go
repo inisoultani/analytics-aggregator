@@ -8,18 +8,33 @@ import (
 )
 
 type PipelineService struct {
-	txManager port.TxManager
+	txManager         port.TxManager
+	enrichmentService port.EnrichmentService
 }
 
-func NewPipelineService(txManager port.TxManager) *PipelineService {
+func NewPipelineService(txManager port.TxManager, enrichmentService port.EnrichmentService) *PipelineService {
 	return &PipelineService{
-		txManager: txManager,
+		txManager:         txManager,
+		enrichmentService: enrichmentService,
 	}
 }
 
-func (a *PipelineService) ProcessAndStore(ctx context.Context, events []domain.Event) (int64, error) {
+func (p *PipelineService) ProcessAndStore(ctx context.Context, events []domain.Event) (int64, error) {
+
+	for i := range events {
+		enrichData, err := p.enrichmentService.EnrichIp(ctx, events[i].ClientIP)
+		if err != nil {
+			slog.Error("Failed to fetch enrich data",
+				slog.String("event_id", events[i].ID.String()),
+				slog.String("client_ip", events[i].ClientIP),
+				slog.Any("err", err))
+		} else {
+			events[i].EnrichedData = enrichData
+		}
+	}
+
 	recs := int64(0)
-	err := a.txManager.WithTx(ctx, func(aar port.AnalyticsAggregatorRepository) error {
+	err := p.txManager.WithTx(ctx, func(aar port.AnalyticsAggregatorRepository) error {
 
 		affectedRecs, err := aar.Event().CreateEvents(ctx, events)
 		if err != nil {

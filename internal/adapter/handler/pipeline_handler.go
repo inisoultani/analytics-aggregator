@@ -28,8 +28,9 @@ func (h *Handler) ProcessAndStoreEvents(w http.ResponseWriter, r *http.Request) 
 		return InternalError(fmt.Sprintf("Failed to marshal raw data : %v", rawDataBytes), err)
 	}
 	event := domain.Event{
-		ID:      uuid.New(),
-		RawData: rawDataBytes,
+		ID:       uuid.New(),
+		RawData:  rawDataBytes,
+		ClientIP: processEventReq.ClientIP,
 	}
 
 	affectedRecs, err := h.service.ProcessAndStore(r.Context(), []domain.Event{event})

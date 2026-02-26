@@ -22,6 +22,7 @@ type Config struct {
 	HealthCheckPeriod  int
 	AppEnv             string
 	LogLevel           *slog.LevelVar
+	GeoAPIBaseURL      string
 }
 
 func Load() (*Config, error) {
@@ -45,6 +46,7 @@ func Load() (*Config, error) {
 		MaxConnLifeTime:    getEnvInt("DB_MAX_LIFE_TIME", 1800),
 		HealthCheckPeriod:  getEnvInt("DB_HEALTH_CHECK_PERIOD", 60),
 		AppEnv:             strings.ToLower(getEnv("APP_ENV", "development")),
+		GeoAPIBaseURL:      getEnv("GEO_API_BASE_URL", "http://ip-api.com"),
 	}, nil
 }
 
