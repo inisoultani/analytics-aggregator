@@ -14,7 +14,7 @@ import (
 type PipelineService struct {
 	txManager        port.TxManager
 	dataEnricher     port.DataEnricher
-	enrichWorkers    []*EnricherWorker
+	enrichWorkerSize int
 	workerPoolChan   chan *EnricherWorker
 	pipelineJobChan  chan *domain.Event
 	batchChan        chan *domain.Event
@@ -28,23 +28,23 @@ type PipelineService struct {
 func NewPipelineService(ctx context.Context, txManager port.TxManager, de port.DataEnricher, cfg *config.Config) *PipelineService {
 	// initiating pipeline service
 	s := &PipelineService{
-		txManager:       txManager,
-		dataEnricher:    de,
-		enrichWorkers:   make([]*EnricherWorker, cfg.EnricherWorkerNum),
-		workerPoolChan:  make(chan *EnricherWorker, cfg.EnricherWorkerNum),
-		batchChan:       make(chan *domain.Event),
-		pipelineJobChan: make(chan *domain.Event, 10),
-		insertBatchSize: cfg.InsertBatchSize,
+		txManager:        txManager,
+		dataEnricher:     de,
+		workerPoolChan:   make(chan *EnricherWorker, cfg.EnricherWorkerSize),
+		batchChan:        make(chan *domain.Event),
+		pipelineJobChan:  make(chan *domain.Event, 10),
+		insertBatchSize:  cfg.InsertBatchSize,
+		enrichWorkerSize: cfg.EnricherWorkerSize,
 	}
 	// initiating workers during service initiation
-	for i := range cfg.EnricherWorkerNum {
+	for i := range cfg.EnricherWorkerSize {
 		workerCtx, workerCancelFunc := context.WithCancelCause(ctx)
 		w := &EnricherWorker{
 			jobChan:           make(chan *domain.Event),
 			enrichmentService: s.dataEnricher,
 			cancelFunc:        workerCancelFunc,
 		}
-		s.enrichWorkers[i] = w
+		// s.enrichWorkers[i] = w
 		s.wgWorker.Add(1)
 		go w.DataEnricherProcess(workerCtx, i, s.batchChan, s.workerPoolChan, &s.wgWorker)
 	}
@@ -75,6 +75,9 @@ func (p *PipelineService) storeWithRetry(ctx context.Context, e *domain.Event, w
 		retryDuration := time.Duration(e.RetryCount*2) * time.Second
 		select {
 		case p.pipelineJobChan <- e:
+			slog.Debug("storeWithRetry success",
+				slog.String("event_id", e.ID.String()),
+				slog.Int("retry_count", e.RetryCount))
 			return
 		case <-time.After(retryDuration):
 			slog.Debug("Failed to store data into the pipeline",
@@ -190,30 +193,34 @@ func (p *PipelineService) insertEvents(ctx context.Context, events []domain.Even
 }
 
 func (p *PipelineService) Close() {
-	// close pipeline job
-	close(p.pipelineJobChan)
-	slog.Debug("close pipelineJobChan DONE")
 
 	// wait all of ongoing storeWithRetry
 	p.wgStoreRetry.Wait()
 	slog.Debug("p.wgStoreRetry.Wait DONE")
 
+	// close pipeline job
+	close(p.pipelineJobChan)
+	slog.Debug("close pipelineJobChan DONE")
+
 	// wait ongoing job distributor process
 	p.wgJobDistributor.Wait()
 	slog.Debug("p.wgJobDistributor.Wait DONE")
 
-	close(p.workerPoolChan)
-	slog.Debug("close workerPoolChan DONE")
-
-	// draining worker pool, close  job channel and terminate each worker
-	for ew := range p.workerPoolChan {
-		close(ew.jobChan)
-		ew.cancelFunc(fmt.Errorf("shutdown pipeline"))
-	}
-	slog.Debug("draining workerPoolChan DONE")
-
 	// close(p.workerPoolChan)
 	// slog.Debug("close workerPoolChan DONE")
+
+	// draining worker pool, close  job channel and terminate each worker
+	workerCount := 0
+	for ew := range p.workerPoolChan {
+		workerCount++
+		close(ew.jobChan)
+		ew.cancelFunc(fmt.Errorf("shutdown pipeline"))
+		if workerCount == p.enrichWorkerSize {
+			close(p.workerPoolChan)
+			slog.Debug("close workerPoolChan DONE")
+		}
+	}
+	slog.Debug("draining and closing workerPoolChan DONE")
 
 	// wait all worker to be terminated
 	p.wgWorker.Wait()
@@ -244,15 +251,17 @@ func (e *EnricherWorker) DataEnricherProcess(ctx context.Context, id int, batchC
 
 	inPool := false
 	for {
-		if !inPool  {
+		if !inPool {
 			select {
-			case workerPool <- e:
-				inPool = true
 			case <-ctx.Done():
 				slog.Info("EnricherWorker interrupted during entering workerPool",
 					slog.Int("id", id),
 					slog.Any("caused_by", context.Cause(ctx)),
 				)
+				return
+			case workerPool <- e:
+				inPool = true
+
 			}
 		}
 
