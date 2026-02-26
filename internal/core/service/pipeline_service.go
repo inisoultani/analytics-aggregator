@@ -140,42 +140,39 @@ func (p *PipelineService) batchInsert(ctx context.Context, wg *sync.WaitGroup) {
 	for {
 		select {
 		case <-ticker.C:
-			if len(events) > 0 {
-				slog.Debug("trigger batch insert via timer ticker")
-				p.insertEvents(ctx, events)
-				clear(events)
-				events = events[:0]
-			} else {
-				slog.Debug("no data exist during timer tick")
-			}
+			events = p.checkAndInsertEvents(ctx, events, "timer_ticker", 0)
 		case e, ok := <-p.batchChan:
 			if !ok {
 				slog.Info("Batch channel in pipeline is closed...")
 				slog.Info("Checking remaining left data in collections...")
 				ticker.Stop()
-				if len(events) > 0 {
-					slog.Debug("Trigger batch insert via batch channel closing")
-					p.insertEvents(ctx, events)
-					clear(events)
-					events = events[:0]
-				} else {
-					slog.Debug("No data exist after closing batch channel")
-				}
+				_ = p.checkAndInsertEvents(ctx, events, "batch_channel_closed", 0)
 				return
 			}
 			events = append(events, *e)
-			if len(events) >= p.insertBatchSize {
-				slog.Debug("trigger batch insert via max size")
-				p.insertEvents(ctx, events)
-				clear(events)
-				events = events[:0]
-			}
+			events = p.checkAndInsertEvents(ctx, events, "event_arrival", p.insertBatchSize-1)
 		case <-ctx.Done():
 			slog.Debug("batchInsert mechanism interrupted",
 				slog.Any("err", context.Cause(ctx)))
 		}
 	}
 
+}
+
+func (p *PipelineService) checkAndInsertEvents(ctx context.Context, events []domain.Event, phase string, min int) []domain.Event {
+	if len(events) > min {
+		slog.Debug("trigger batch insert",
+			slog.String("via", phase),
+		)
+		p.insertEvents(ctx, events)
+		clear(events)
+		events = events[:0]
+	} else {
+		slog.Debug("no data exist to trigger insert",
+			slog.String("via", phase),
+		)
+	}
+	return events
 }
 
 func (p *PipelineService) insertEvents(ctx context.Context, events []domain.Event) {
