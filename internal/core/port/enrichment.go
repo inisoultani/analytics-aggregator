@@ -2,6 +2,6 @@ package port
 
 import "context"
 
-type EnrichmentService interface {
+type DataEnricher interface {
 	EnrichIp(ctx context.Context, ip string) ([]byte, error)
 }

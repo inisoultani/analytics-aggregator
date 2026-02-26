@@ -27,13 +27,13 @@ func (h *Handler) ProcessAndStoreEvents(w http.ResponseWriter, r *http.Request) 
 	if err != nil {
 		return InternalError(fmt.Sprintf("Failed to marshal raw data : %v", rawDataBytes), err)
 	}
-	event := domain.Event{
+	event := &domain.Event{
 		ID:       uuid.New(),
 		RawData:  rawDataBytes,
 		ClientIP: processEventReq.ClientIP,
 	}
 
-	affectedRecs, err := h.service.ProcessAndStore(r.Context(), []domain.Event{event})
+	affectedRecs, err := h.service.ProcessAndStore(r.Context(), event)
 	if err != nil {
 		return InternalError("pipeline ingestion failed", err)
 	}

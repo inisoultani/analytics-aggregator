@@ -23,6 +23,7 @@ type Config struct {
 	AppEnv             string
 	LogLevel           *slog.LevelVar
 	GeoAPIBaseURL      string
+	EnricherWorkerNum  int
 }
 
 func Load() (*Config, error) {
@@ -47,6 +48,7 @@ func Load() (*Config, error) {
 		HealthCheckPeriod:  getEnvInt("DB_HEALTH_CHECK_PERIOD", 60),
 		AppEnv:             strings.ToLower(getEnv("APP_ENV", "development")),
 		GeoAPIBaseURL:      getEnv("GEO_API_BASE_URL", "http://ip-api.com"),
+		EnricherWorkerNum:  getEnvInt("ENRICHER_WORKER_NUM", 2),
 	}, nil
 }
 

@@ -56,7 +56,7 @@ func main() {
 	// initate core
 	txManager := repository.NewPostgresTxManager(pool)
 	geoApiClient := extapi.NewGeoAPIClient(cfg.GeoAPIBaseURL)
-	service := service.NewPipelineService(txManager, geoApiClient)
+	service := service.NewPipelineService(mainCtx, txManager, geoApiClient, cfg)
 
 	// initiate app
 	addr := ":" + cfg.ServerPort
