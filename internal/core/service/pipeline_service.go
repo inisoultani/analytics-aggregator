@@ -151,7 +151,16 @@ func (p *PipelineService) batchInsert(ctx context.Context, wg *sync.WaitGroup) {
 		case e, ok := <-p.batchChan:
 			if !ok {
 				slog.Info("Batch channel in pipeline is closed...")
+				slog.Info("Checking remaining left data in collections...")
 				ticker.Stop()
+				if len(events) > 0 {
+					slog.Debug("Trigger batch insert via batch channel closing")
+					p.insertEvents(ctx, events)
+					clear(events)
+					events = events[:0]
+				} else {
+					slog.Debug("No data exist after closing batch channel")
+				}
 				return
 			}
 			events = append(events, *e)
