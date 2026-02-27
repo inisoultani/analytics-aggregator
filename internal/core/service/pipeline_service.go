@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -24,6 +25,8 @@ type PipelineService struct {
 	wgStoreRetry     sync.WaitGroup
 	wgJobDistributor sync.WaitGroup
 	insertBatchSize  int
+	rejectedCount    atomic.Int64
+	successCount     atomic.Int64
 }
 
 func NewPipelineService(ctx context.Context, txManager port.TxManager, de port.DataEnricher, cfg *config.Config) *PipelineService {
@@ -33,7 +36,7 @@ func NewPipelineService(ctx context.Context, txManager port.TxManager, de port.D
 		dataEnricher:     de,
 		workerPoolChan:   make(chan *EnricherWorker, cfg.EnricherWorkerSize),
 		batchChan:        make(chan *domain.Event),
-		pipelineJobChan:  make(chan *domain.Event, 10),
+		pipelineJobChan:  make(chan *domain.Event, 30),
 		insertBatchSize:  cfg.InsertBatchSize,
 		enrichWorkerSize: cfg.EnricherWorkerSize,
 		enrichWorkerList: []*EnricherWorker{},
@@ -95,6 +98,7 @@ func (p *PipelineService) storeWithRetry(ctx context.Context, e *domain.Event, w
 				slog.Any("err", context.Cause(ctx)))
 		}
 	}
+	p.rejectedCount.Add(1)
 }
 
 func (p *PipelineService) jobDistributor(ctx context.Context, wg *sync.WaitGroup) {
@@ -194,6 +198,7 @@ func (p *PipelineService) insertEvents(ctx context.Context, events []domain.Even
 		slog.Info("Successfully insertEvents",
 			slog.Int64("affected_records", affectedRecs),
 		)
+		p.successCount.Add(affectedRecs)
 		return nil
 	})
 
@@ -245,6 +250,11 @@ func (p *PipelineService) Close() {
 	// wait batch process to terminated
 	p.wgBatch.Wait()
 	slog.Debug("p.wgBatch.Wait DONE")
+
+	slog.Debug("Service total data",
+		slog.Int64("rejected", p.rejectedCount.Load()),
+		slog.Int64("succed", p.successCount.Load()),
+	)
 
 }
 
