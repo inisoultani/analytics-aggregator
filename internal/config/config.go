@@ -25,6 +25,7 @@ type Config struct {
 	GeoAPIBaseURL      string
 	EnricherWorkerSize int
 	InsertBatchSize    int
+	PipelineJobSize    int
 }
 
 func Load() (*Config, error) {
@@ -51,6 +52,7 @@ func Load() (*Config, error) {
 		GeoAPIBaseURL:      getEnv("GEO_API_BASE_URL", "http://ip-api.com"),
 		EnricherWorkerSize: getEnvInt("ENRICHER_WORKER_SIZE", 2),
 		InsertBatchSize:    getEnvInt("INSERT_BATCH_SIZE", 5),
+		PipelineJobSize:    getEnvInt("PIPELINE_JOB_SIZE", 50),
 	}, nil
 }
 

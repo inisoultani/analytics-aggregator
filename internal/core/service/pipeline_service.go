@@ -36,7 +36,7 @@ func NewPipelineService(ctx context.Context, txManager port.TxManager, de port.D
 		dataEnricher:     de,
 		workerPoolChan:   make(chan *EnricherWorker, cfg.EnricherWorkerSize),
 		batchChan:        make(chan *domain.Event),
-		pipelineJobChan:  make(chan *domain.Event, 30),
+		pipelineJobChan:  make(chan *domain.Event, cfg.PipelineJobSize),
 		insertBatchSize:  cfg.InsertBatchSize,
 		enrichWorkerSize: cfg.EnricherWorkerSize,
 		enrichWorkerList: []*EnricherWorker{},
@@ -255,7 +255,6 @@ func (p *PipelineService) Close() {
 		slog.Int64("rejected", p.rejectedCount.Load()),
 		slog.Int64("succed", p.successCount.Load()),
 	)
-
 }
 
 type EnricherWorker struct {
@@ -275,8 +274,6 @@ func (e *EnricherWorker) DataEnricherProcess(ctx context.Context, id int, batchC
 	inPool := false
 	tickerDuration := time.Duration(5 * time.Second)
 	ticker := time.NewTicker(tickerDuration)
-	timeout := time.Duration(2 * time.Second)
-	cause := fmt.Errorf("api call timeout, waiting time was : %.2fs", timeout.Seconds())
 	for {
 		if !inPool {
 			select {
@@ -300,31 +297,9 @@ func (e *EnricherWorker) DataEnricherProcess(ctx context.Context, id int, batchC
 				)
 				return
 			}
-			start := time.Now()
-			// intentionally use different context for each api call
-			// to ensure no data loss during enrichment process by
-			// avoid context-cancelled during api call process
-			apiCtx, cancelFunc := context.WithTimeoutCause(context.Background(), timeout, cause)
-			defer cancelFunc()
-			enrichData, err := e.dataEnricher.EnrichIp(apiCtx, event.ClientIP)
-			if err != nil {
-				slog.Error("Failed to fetch enrich data",
-					slog.Int("id", id),
-					slog.String("event_id", event.ID.String()),
-					slog.String("client_ip", event.ClientIP),
-					slog.Any("err", err),
-				)
-			} else {
-				event.EnrichedData = enrichData
-			}
-			batchChan <- event
 			inPool = false
 			ticker.Reset(tickerDuration)
-			slog.Debug("EnricherWorker finish enriching data",
-				slog.Int("id", id),
-				slog.String("event_id", event.ID.String()),
-				slog.Duration("duration", time.Since(start)),
-			)
+			e.enrichWithRetry(ctx, event, batchChan)
 		case <-ticker.C:
 			slog.Debug("EnricherWorker done sleeping, still waiting for job...",
 				slog.Int("id", id),
@@ -337,4 +312,74 @@ func (e *EnricherWorker) DataEnricherProcess(ctx context.Context, id int, batchC
 			return
 		}
 	}
+}
+
+func (e *EnricherWorker) enrichWithRetry(ctx context.Context, event *domain.Event, batchChan chan<- *domain.Event) {
+	// intentionally use different context for each api call
+	// to ensure no data loss during enrichment process by
+	// avoid context-cancelled during api call process
+	timeout := time.Duration(1000 * time.Millisecond)
+	cause := fmt.Errorf("api call timeout, waiting time was : %dms", timeout.Milliseconds())
+	apiCtx, cancelFunc := context.WithTimeoutCause(context.Background(), timeout, cause)
+	defer cancelFunc()
+
+	err := e.enrich(apiCtx, event, batchChan)
+	if err != nil {
+		slog.Debug("Enrich process error, entering retry flow",
+			slog.String("event_id", event.ID.String()),
+			slog.Any("err", context.Cause(apiCtx)),
+		)
+		event.RetryCount = 0
+		for event.RetryCount < 3 {
+			event.RetryCount++
+			retryDuration := time.Duration(event.RetryCount*2) * time.Second
+			select {
+			case <-ctx.Done():
+				slog.Debug("EnrichWithRetry mechanism interrupted",
+					slog.String("event_id", event.ID.String()),
+					slog.Int("retry_count", event.RetryCount),
+					slog.Any("err", context.Cause(ctx)))
+			case <-time.After(retryDuration):
+				err := e.enrich(apiCtx, event, batchChan)
+				if err == nil {
+					return
+				}
+				slog.Debug("Enrich retry error",
+					slog.String("event_id", event.ID.String()),
+					slog.Int("retry_count", event.RetryCount),
+					slog.Any("err", err),
+				)
+			}
+		}
+		// TODO if after multiple retry stil failed, push to deadletter pipeline
+		slog.Debug("Enrich retry reach max attempts",
+			slog.String("event_id", event.ID.String()),
+			slog.Int("retry_count", event.RetryCount),
+			slog.Any("err", err),
+		)
+	}
+
+}
+
+func (e *EnricherWorker) enrich(ctx context.Context, event *domain.Event, batchChan chan<- *domain.Event) error {
+	start := time.Now()
+
+	enrichData, err := e.dataEnricher.EnrichIp(ctx, event.ClientIP)
+	if err != nil {
+		slog.Error("Failed to fetch enrich data",
+			slog.Int("id", e.id),
+			slog.String("event_id", event.ID.String()),
+			slog.String("client_ip", event.ClientIP),
+			slog.Any("err", err),
+		)
+		return err
+	}
+	event.EnrichedData = enrichData
+	batchChan <- event
+	slog.Debug("EnricherWorker finish enriching data",
+		slog.Int("id", e.id),
+		slog.String("event_id", event.ID.String()),
+		slog.Duration("duration", time.Since(start)),
+	)
+	return nil
 }
