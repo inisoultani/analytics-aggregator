@@ -25,7 +25,7 @@ type PostgresTxManager struct {
 	queries *sqlc.Queries
 }
 
-func (p *PostgresTxManager) WithTx(ctx context.Context, fn func(port.AnalyticsAggregatorRepository) error) error {
+func (p *PostgresTxManager) WithTx(ctx context.Context, fn func(port.PipelineRepository) error) error {
 	return db.WithTx(ctx, p.pool, func(tx pgx.Tx) error {
 		txRepo := &PostgresAnalyticsAggregatorRepository{
 			queries: p.queries.WithTx(tx),

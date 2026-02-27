@@ -21,12 +21,14 @@ type PipelineService struct {
 	pipelineJobChan  chan *domain.Event
 	batchChan        chan *domain.Event
 	wgWorker         sync.WaitGroup
-	wgBatch          sync.WaitGroup
+	wgBatchEvents    sync.WaitGroup
+	wgBatchDLE       sync.WaitGroup
 	wgStoreRetry     sync.WaitGroup
 	wgJobDistributor sync.WaitGroup
 	insertBatchSize  int
 	rejectedCount    atomic.Int64
 	successCount     atomic.Int64
+	deadLetterChan   chan *domain.Event
 }
 
 func NewPipelineService(ctx context.Context, txManager port.TxManager, de port.DataEnricher, cfg *config.Config) *PipelineService {
@@ -40,6 +42,7 @@ func NewPipelineService(ctx context.Context, txManager port.TxManager, de port.D
 		insertBatchSize:  cfg.InsertBatchSize,
 		enrichWorkerSize: cfg.EnricherWorkerSize,
 		enrichWorkerList: []*EnricherWorker{},
+		deadLetterChan:   make(chan *domain.Event),
 	}
 	// initiating workers during service initiation
 	for i := range cfg.EnricherWorkerSize {
@@ -52,16 +55,20 @@ func NewPipelineService(ctx context.Context, txManager port.TxManager, de port.D
 		}
 		s.enrichWorkerList = append(s.enrichWorkerList, w)
 		s.wgWorker.Add(1)
-		go w.DataEnricherProcess(workerCtx, i+1, s.batchChan, s.workerPoolChan, &s.wgWorker)
+		go w.DataEnricherProcess(workerCtx, i+1, s.batchChan, s.workerPoolChan, s.deadLetterChan, &s.wgWorker)
 	}
 
 	// initiating job distributor
 	s.wgJobDistributor.Add(1)
 	go s.jobDistributor(ctx, &s.wgJobDistributor)
 
-	// initiating batch process
-	s.wgBatch.Add(1)
-	go s.batchInsert(ctx, &s.wgBatch)
+	// initiating batch process for events
+	s.wgBatchEvents.Add(1)
+	go s.batchInsert(ctx, &s.wgBatchEvents, "events", s.batchChan, s.insertEvents)
+
+	// initiating batch process for dead-letter-events
+	s.wgBatchDLE.Add(1)
+	go s.batchInsert(ctx, &s.wgBatchDLE, "dead-letter-events", s.deadLetterChan, s.insertDeadLetterEvents)
 	return s
 }
 
@@ -135,78 +142,74 @@ func (p *PipelineService) assignWorker(e *domain.Event) {
 	ew.jobChan <- e
 }
 
-func (p *PipelineService) batchInsert(ctx context.Context, wg *sync.WaitGroup) {
+func (p *PipelineService) batchInsert(
+	ctx context.Context,
+	wg *sync.WaitGroup,
+	batchName string,
+	c <-chan *domain.Event,
+	fn func(ctx context.Context, events []domain.Event) (int64, error)) {
 	defer wg.Done()
 
 	duration := time.Duration(3000 * time.Millisecond)
 	ticker := time.NewTicker(duration)
 	slog.Info("Initiating batchInsert with ticker...",
-		slog.Any("ticker", ticker),
+		slog.String("batch_id", batchName),
+		slog.Duration("tick_duration", duration),
 	)
 
 	events := make([]domain.Event, 0)
 	for {
 		select {
 		case <-ticker.C:
-			events = p.checkAndInsertEvents(ctx, events, "timer_ticker", 0)
-		case e, ok := <-p.batchChan:
+			events = p.checkAndInsert(ctx, events, "timer_ticker", 0, batchName, fn)
+		case e, ok := <-c:
 			if !ok {
-				slog.Info("Batch channel in pipeline is closed...")
-				slog.Info("Checking remaining left data in collections...")
+				slog.Info("Batch channel in pipeline is closed...", slog.String("batch_id", batchName))
+				slog.Info("Checking remaining left data in collections...", slog.String("batch_id", batchName))
 				ticker.Stop()
-				_ = p.checkAndInsertEvents(ctx, events, "batch_channel_closed", 0)
+				_ = p.checkAndInsert(ctx, events, "batch_channel_closed", 0, batchName, fn)
 				return
 			}
 			events = append(events, *e)
-			events = p.checkAndInsertEvents(ctx, events, "event_arrival", p.insertBatchSize-1)
+			events = p.checkAndInsert(ctx, events, "event_arrival", p.insertBatchSize-1, batchName, fn)
 			// reset ticker to restart the ticker
 			ticker.Reset(duration)
 		case <-ctx.Done():
 			slog.Debug("batchInsert mechanism interrupted",
+				slog.String("batch_id", batchName),
 				slog.Any("err", context.Cause(ctx)))
 		}
 	}
-
 }
 
-func (p *PipelineService) checkAndInsertEvents(ctx context.Context, events []domain.Event, phase string, min int) []domain.Event {
+func (p *PipelineService) checkAndInsert(
+	ctx context.Context,
+	events []domain.Event,
+	phase string, min int,
+	batchName string,
+	fn func(ctx context.Context, events []domain.Event) (int64, error)) []domain.Event {
 	if len(events) > min {
 		slog.Debug("trigger batch insert",
+			slog.String("batch_id", batchName),
 			slog.String("via", phase),
 		)
-		p.insertEvents(ctx, events)
+		affectedRecs, err := fn(ctx, events)
+		if err != nil {
+			slog.Error("Batch insert failed", slog.String("batch_id", batchName))
+		}
+		slog.Debug("Batch insert succed",
+			slog.String("batch_id", batchName),
+			slog.Int64("affected_records", affectedRecs),
+		)
 		clear(events)
 		events = events[:0]
 	} else {
 		slog.Debug("no data exist / not meet the treshold to trigger insert",
+			slog.String("batch_id", batchName),
 			slog.String("via", phase),
 		)
 	}
 	return events
-}
-
-func (p *PipelineService) insertEvents(ctx context.Context, events []domain.Event) {
-
-	err := p.txManager.WithTx(ctx, func(aar port.AnalyticsAggregatorRepository) error {
-
-		affectedRecs, err := aar.Event().CreateEvents(ctx, events)
-		if err != nil {
-			slog.Error("create events error", slog.Any("err", err))
-			return err
-		}
-
-		slog.Info("Successfully insertEvents",
-			slog.Int64("affected_records", affectedRecs),
-		)
-		p.successCount.Add(affectedRecs)
-		return nil
-	})
-
-	if err != nil {
-		slog.Error("insertEvents batch process failed",
-			slog.Any("err", err),
-		)
-	}
 }
 
 func (p *PipelineService) Close() {
@@ -248,8 +251,16 @@ func (p *PipelineService) Close() {
 	slog.Debug("close batchChan DONE")
 
 	// wait batch process to terminated
-	p.wgBatch.Wait()
+	p.wgBatchEvents.Wait()
 	slog.Debug("p.wgBatch.Wait DONE")
+
+	// close deadLetter channel & will trigger ticker to stop
+	close(p.deadLetterChan)
+	slog.Debug("close deadLetterChan DONE")
+
+	// wait batch process to terminated
+	p.wgBatchDLE.Wait()
+	slog.Debug("p.wgBatchDLE.Wait DONE")
 
 	slog.Debug("Service total data",
 		slog.Int64("rejected", p.rejectedCount.Load()),
@@ -264,7 +275,7 @@ type EnricherWorker struct {
 	cancelFunc   context.CancelCauseFunc
 }
 
-func (e *EnricherWorker) DataEnricherProcess(ctx context.Context, id int, batchChan chan<- *domain.Event, workerPool chan<- *EnricherWorker, wg *sync.WaitGroup) {
+func (e *EnricherWorker) DataEnricherProcess(ctx context.Context, id int, batchChan chan<- *domain.Event, workerPool chan<- *EnricherWorker, deadLetterChan chan<- *domain.Event, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	slog.Info("EnricherWorker initiating",
@@ -299,7 +310,7 @@ func (e *EnricherWorker) DataEnricherProcess(ctx context.Context, id int, batchC
 			}
 			inPool = false
 			ticker.Reset(tickerDuration)
-			e.enrichWithRetry(ctx, event, batchChan)
+			e.enrichWithRetry(ctx, event, batchChan, deadLetterChan)
 		case <-ticker.C:
 			slog.Debug("EnricherWorker done sleeping, still waiting for job...",
 				slog.Int("id", id),
@@ -314,7 +325,7 @@ func (e *EnricherWorker) DataEnricherProcess(ctx context.Context, id int, batchC
 	}
 }
 
-func (e *EnricherWorker) enrichWithRetry(ctx context.Context, event *domain.Event, batchChan chan<- *domain.Event) {
+func (e *EnricherWorker) enrichWithRetry(ctx context.Context, event *domain.Event, batchChan chan<- *domain.Event, deadLetterChan chan<- *domain.Event) {
 	// intentionally use different context for each api call
 	// to ensure no data loss during enrichment process by
 	// avoid context-cancelled during api call process
@@ -352,11 +363,13 @@ func (e *EnricherWorker) enrichWithRetry(ctx context.Context, event *domain.Even
 			}
 		}
 		// TODO if after multiple retry stil failed, push to deadletter pipeline
-		slog.Debug("Enrich retry reach max attempts",
+		slog.Debug("Enrich retry reach max attempts, will send the event to DLE",
 			slog.String("event_id", event.ID.String()),
 			slog.Int("retry_count", event.RetryCount),
 			slog.Any("err", err),
 		)
+		event.ErrorReason = err.Error()
+		deadLetterChan <- event
 	}
 
 }
@@ -382,4 +395,110 @@ func (e *EnricherWorker) enrich(ctx context.Context, event *domain.Event, batchC
 		slog.Duration("duration", time.Since(start)),
 	)
 	return nil
+}
+
+// func (p *PipelineService) batchInsertEvent(ctx context.Context, wg *sync.WaitGroup) {
+// 	defer wg.Done()
+
+// 	duration := time.Duration(3000 * time.Millisecond)
+// 	ticker := time.NewTicker(duration)
+// 	slog.Info("Initiating batchInsert with ticker...",
+// 		slog.Any("ticker", ticker),
+// 	)
+
+// 	events := make([]domain.Event, 0)
+// 	for {
+// 		select {
+// 		case <-ticker.C:
+// 			events = p.checkAndInsertEvents(ctx, events, "timer_ticker", 0)
+// 		case e, ok := <-p.batchChan:
+// 			if !ok {
+// 				slog.Info("Batch channel in pipeline is closed...")
+// 				slog.Info("Checking remaining left data in collections...")
+// 				ticker.Stop()
+// 				_ = p.checkAndInsertEvents(ctx, events, "batch_channel_closed", 0)
+// 				return
+// 			}
+// 			events = append(events, *e)
+// 			events = p.checkAndInsertEvents(ctx, events, "event_arrival", p.insertBatchSize-1)
+// 			// reset ticker to restart the ticker
+// 			ticker.Reset(duration)
+// 		case <-ctx.Done():
+// 			slog.Debug("batchInsert mechanism interrupted",
+// 				slog.Any("err", context.Cause(ctx)))
+// 		}
+// 	}
+
+// }
+
+// func (p *PipelineService) checkAndInsertEvents(ctx context.Context, events []domain.Event, phase string, min int) []domain.Event {
+// 	if len(events) > min {
+// 		slog.Debug("trigger batch insert",
+// 			slog.String("via", phase),
+// 		)
+// 		p.insertEvents(ctx, events)
+// 		clear(events)
+// 		events = events[:0]
+// 	} else {
+// 		slog.Debug("no data exist / not meet the treshold to trigger insert",
+// 			slog.String("via", phase),
+// 		)
+// 	}
+// 	return events
+// }
+
+func (p *PipelineService) insertEvents(ctx context.Context, events []domain.Event) (int64, error) {
+
+	recs := int64(0)
+	err := p.txManager.WithTx(ctx, func(aar port.PipelineRepository) error {
+
+		affectedRecs, err := aar.Event().CreateEvents(ctx, events)
+		if err != nil {
+			slog.Error("create events error", slog.Any("err", err))
+			return err
+		}
+
+		slog.Info("Successfully insertEvents",
+			slog.Int64("affected_records", affectedRecs),
+		)
+		p.successCount.Add(affectedRecs)
+		recs = affectedRecs
+		return nil
+	})
+
+	if err != nil {
+		slog.Error("insertEvents batch process failed",
+			slog.Any("err", err),
+		)
+		return 0, err
+	}
+	return recs, nil
+}
+
+func (p *PipelineService) insertDeadLetterEvents(ctx context.Context, events []domain.Event) (int64, error) {
+
+	recs := int64(0)
+	err := p.txManager.WithTx(ctx, func(pr port.PipelineRepository) error {
+
+		affectedRecs, err := pr.DeadLetterEvent().CreateDeadLetters(ctx, events)
+		if err != nil {
+			slog.Error("insertDeadLetterEvents error", slog.Any("err", err))
+			return err
+		}
+
+		slog.Info("Successfully insert DeadLetterEvents",
+			slog.Int64("affected_records", affectedRecs),
+		)
+		p.successCount.Add(affectedRecs)
+		recs = affectedRecs
+		return nil
+	})
+
+	if err != nil {
+		slog.Error("insertDeadLetterEvents batch process failed",
+			slog.Any("err", err),
+		)
+		return 0, err
+	}
+	return recs, nil
 }

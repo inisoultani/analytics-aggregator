@@ -10,15 +10,15 @@ type EventRepository interface {
 }
 
 type DeadLetterEventRepository interface {
-	CreateDeadLetter(ctx context.Context, e domain.Event, reason string) (string, error)
+	CreateDeadLetters(ctx context.Context, e []domain.Event) (int64, error)
 }
 
-type AnalyticsAggregatorRepository interface {
+type PipelineRepository interface {
 	Event() EventRepository
 	DeadLetterEvent() DeadLetterEventRepository
 }
 
 type TxManager interface {
 	// transaction
-	WithTx(ctx context.Context, fn func(AnalyticsAggregatorRepository) error) error
+	WithTx(ctx context.Context, fn func(PipelineRepository) error) error
 }
