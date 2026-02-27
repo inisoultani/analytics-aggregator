@@ -134,7 +134,8 @@ func (p *PipelineService) assignWorker(e *domain.Event) {
 func (p *PipelineService) batchInsert(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
 
-	ticker := time.NewTicker(3000 * time.Millisecond)
+	duration := time.Duration(3000 * time.Millisecond)
+	ticker := time.NewTicker(duration)
 	slog.Info("Initiating batchInsert with ticker...",
 		slog.Any("ticker", ticker),
 	)
@@ -154,6 +155,8 @@ func (p *PipelineService) batchInsert(ctx context.Context, wg *sync.WaitGroup) {
 			}
 			events = append(events, *e)
 			events = p.checkAndInsertEvents(ctx, events, "event_arrival", p.insertBatchSize-1)
+			// reset ticker to restart the ticker
+			ticker.Reset(duration)
 		case <-ctx.Done():
 			slog.Debug("batchInsert mechanism interrupted",
 				slog.Any("err", context.Cause(ctx)))
@@ -260,6 +263,8 @@ func (e *EnricherWorker) DataEnricherProcess(ctx context.Context, id int, batchC
 	)
 
 	inPool := false
+	tickerDuration := time.Duration(5 * time.Second)
+	ticker := time.NewTicker(tickerDuration)
 	timeout := time.Duration(2 * time.Second)
 	cause := fmt.Errorf("api call timeout, waiting time was : %.2fs", timeout.Seconds())
 	for {
@@ -304,12 +309,13 @@ func (e *EnricherWorker) DataEnricherProcess(ctx context.Context, id int, batchC
 			}
 			batchChan <- event
 			inPool = false
+			ticker.Reset(tickerDuration)
 			slog.Debug("EnricherWorker finish enriching data",
 				slog.Int("id", id),
 				slog.String("event_id", event.ID.String()),
 				slog.Duration("duration", time.Since(start)),
 			)
-		case <-time.After(5 * time.Second):
+		case <-ticker.C:
 			slog.Debug("EnricherWorker done sleeping, still waiting for job...",
 				slog.Int("id", id),
 			)
