@@ -49,7 +49,7 @@ func Load() (*Config, error) {
 		HealthCheckPeriod:  getEnvInt("DB_HEALTH_CHECK_PERIOD", 60),
 		AppEnv:             strings.ToLower(getEnv("APP_ENV", "development")),
 		GeoAPIBaseURL:      getEnv("GEO_API_BASE_URL", "http://ip-api.com"),
-		EnricherWorkerSize: getEnvInt("ENRICHER_WORKER_NUM", 2),
+		EnricherWorkerSize: getEnvInt("ENRICHER_WORKER_SIZE", 2),
 		InsertBatchSize:    getEnvInt("INSERT_BATCH_SIZE", 5),
 	}, nil
 }
