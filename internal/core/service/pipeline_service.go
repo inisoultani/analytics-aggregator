@@ -446,7 +446,7 @@ func (e *EnricherWorker) enrich(ctx context.Context, event *domain.Event, batchC
 	// intentionally use different context for each api call
 	// since on each attempt, it will already marked as Canceled (DeadlineExceeded).
 	// to ensure no data loss during enrichment process by
-	timeout := time.Duration(10 * time.Millisecond)
+	timeout := time.Duration(1000 * time.Millisecond)
 	cause := fmt.Errorf("api call timeout, waiting time was : %dms", timeout.Milliseconds())
 	apiCtx, cancelFunc := context.WithTimeoutCause(context.Background(), timeout, cause)
 	defer cancelFunc()
