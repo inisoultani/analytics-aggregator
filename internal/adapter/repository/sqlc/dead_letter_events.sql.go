@@ -6,26 +6,11 @@
 package sqlc
 
 import (
-	"context"
-
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const insertDeadLetter = `-- name: InsertDeadLetter :one
-INSERT INTO dead_letter_events (id, raw_data, error_reason)
-VALUES ($1, $2, $3)
-returning id
-`
-
-type InsertDeadLetterParams struct {
+type BulkInsertDeadLetterEventsParams struct {
 	ID          pgtype.UUID
 	RawData     []byte
 	ErrorReason string
-}
-
-func (q *Queries) InsertDeadLetter(ctx context.Context, arg InsertDeadLetterParams) (pgtype.UUID, error) {
-	row := q.db.QueryRow(ctx, insertDeadLetter, arg.ID, arg.RawData, arg.ErrorReason)
-	var id pgtype.UUID
-	err := row.Scan(&id)
-	return id, err
 }

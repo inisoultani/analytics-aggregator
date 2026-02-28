@@ -9,6 +9,40 @@ import (
 	"context"
 )
 
+// iteratorForBulkInsertDeadLetterEvents implements pgx.CopyFromSource.
+type iteratorForBulkInsertDeadLetterEvents struct {
+	rows                 []BulkInsertDeadLetterEventsParams
+	skippedFirstNextCall bool
+}
+
+func (r *iteratorForBulkInsertDeadLetterEvents) Next() bool {
+	if len(r.rows) == 0 {
+		return false
+	}
+	if !r.skippedFirstNextCall {
+		r.skippedFirstNextCall = true
+		return true
+	}
+	r.rows = r.rows[1:]
+	return len(r.rows) > 0
+}
+
+func (r iteratorForBulkInsertDeadLetterEvents) Values() ([]interface{}, error) {
+	return []interface{}{
+		r.rows[0].ID,
+		r.rows[0].RawData,
+		r.rows[0].ErrorReason,
+	}, nil
+}
+
+func (r iteratorForBulkInsertDeadLetterEvents) Err() error {
+	return nil
+}
+
+func (q *Queries) BulkInsertDeadLetterEvents(ctx context.Context, arg []BulkInsertDeadLetterEventsParams) (int64, error) {
+	return q.db.CopyFrom(ctx, []string{"dead_letter_events"}, []string{"id", "raw_data", "error_reason"}, &iteratorForBulkInsertDeadLetterEvents{rows: arg})
+}
+
 // iteratorForBulkInsertEvents implements pgx.CopyFromSource.
 type iteratorForBulkInsertEvents struct {
 	rows                 []BulkInsertEventsParams

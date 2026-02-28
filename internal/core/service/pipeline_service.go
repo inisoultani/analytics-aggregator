@@ -12,6 +12,8 @@ import (
 	"time"
 )
 
+type insertAction func(context.Context, []domain.Event, string) (int64, error)
+
 type PipelineService struct {
 	txManager        port.TxManager
 	dataEnricher     port.DataEnricher
@@ -20,6 +22,7 @@ type PipelineService struct {
 	workerPoolChan   chan *EnricherWorker
 	pipelineJobChan  chan *domain.Event
 	batchChan        chan *domain.Event
+	deadLetterChan   chan *domain.Event
 	wgWorker         sync.WaitGroup
 	wgBatchEvents    sync.WaitGroup
 	wgBatchDLE       sync.WaitGroup
@@ -28,7 +31,7 @@ type PipelineService struct {
 	insertBatchSize  int
 	rejectedCount    atomic.Int64
 	successCount     atomic.Int64
-	deadLetterChan   chan *domain.Event
+	deadLetterCount  atomic.Int64
 }
 
 func NewPipelineService(ctx context.Context, txManager port.TxManager, de port.DataEnricher, cfg *config.Config) *PipelineService {
@@ -142,12 +145,7 @@ func (p *PipelineService) assignWorker(e *domain.Event) {
 	ew.jobChan <- e
 }
 
-func (p *PipelineService) batchInsert(
-	ctx context.Context,
-	wg *sync.WaitGroup,
-	batchName string,
-	c <-chan *domain.Event,
-	fn func(ctx context.Context, events []domain.Event) (int64, error)) {
+func (p *PipelineService) batchInsert(ctx context.Context, wg *sync.WaitGroup, batchName string, c <-chan *domain.Event, insertAction insertAction) {
 	defer wg.Done()
 
 	duration := time.Duration(3000 * time.Millisecond)
@@ -161,17 +159,17 @@ func (p *PipelineService) batchInsert(
 	for {
 		select {
 		case <-ticker.C:
-			events = p.checkAndInsert(ctx, events, "timer_ticker", 0, batchName, fn)
+			events = p.checkAndInsert(ctx, events, "timer_ticker", 0, batchName, insertAction)
 		case e, ok := <-c:
 			if !ok {
 				slog.Info("Batch channel in pipeline is closed...", slog.String("batch_id", batchName))
 				slog.Info("Checking remaining left data in collections...", slog.String("batch_id", batchName))
 				ticker.Stop()
-				_ = p.checkAndInsert(ctx, events, "batch_channel_closed", 0, batchName, fn)
+				_ = p.checkAndInsert(ctx, events, "batch_channel_closed", 0, batchName, insertAction)
 				return
 			}
 			events = append(events, *e)
-			events = p.checkAndInsert(ctx, events, "event_arrival", p.insertBatchSize-1, batchName, fn)
+			events = p.checkAndInsert(ctx, events, "event_arrival", p.insertBatchSize-1, batchName, insertAction)
 			// reset ticker to restart the ticker
 			ticker.Reset(duration)
 		case <-ctx.Done():
@@ -182,18 +180,13 @@ func (p *PipelineService) batchInsert(
 	}
 }
 
-func (p *PipelineService) checkAndInsert(
-	ctx context.Context,
-	events []domain.Event,
-	phase string, min int,
-	batchName string,
-	fn func(ctx context.Context, events []domain.Event) (int64, error)) []domain.Event {
+func (p *PipelineService) checkAndInsert(ctx context.Context, events []domain.Event, phase string, min int, batchName string, insertAction insertAction) []domain.Event {
 	if len(events) > min {
 		slog.Debug("trigger batch insert",
 			slog.String("batch_id", batchName),
 			slog.String("via", phase),
 		)
-		affectedRecs, err := fn(ctx, events)
+		affectedRecs, err := insertAction(ctx, events, batchName)
 		if err != nil {
 			slog.Error("Batch insert failed", slog.String("batch_id", batchName))
 		}
@@ -210,6 +203,54 @@ func (p *PipelineService) checkAndInsert(
 		)
 	}
 	return events
+}
+
+func (p *PipelineService) insertEvents(ctx context.Context, events []domain.Event, batchName string) (int64, error) {
+	recs, err := p.executeInserts(ctx, batchName, func(pr port.PipelineRepository) (int64, error) {
+		return pr.Event().CreateEvents(ctx, events)
+	})
+	if err != nil {
+		return 0, err
+	}
+	p.successCount.Add(recs)
+	return recs, nil
+}
+
+func (p *PipelineService) insertDeadLetterEvents(ctx context.Context, events []domain.Event, batchName string) (int64, error) {
+	recs, err := p.executeInserts(ctx, batchName, func(pr port.PipelineRepository) (int64, error) {
+		return pr.DeadLetterEvent().CreateDeadLetters(ctx, events)
+	})
+	if err != nil {
+		return 0, err
+	}
+	p.deadLetterCount.Add(recs)
+	return recs, nil
+}
+
+func (p *PipelineService) executeInserts(ctx context.Context, batchName string, insertFn func(port.PipelineRepository) (int64, error)) (int64, error) {
+	var recs int64
+	err := p.txManager.WithTx(ctx, func(pr port.PipelineRepository) error {
+		affectedRecs, err := insertFn(pr)
+		if err != nil {
+			slog.Error("executeInserts error",
+				slog.String("batch_id", batchName),
+				slog.Any("err", err),
+			)
+			return err
+		}
+
+		slog.Info("Successfully executeInserts",
+			slog.String("batch_id", batchName),
+			slog.Int64("affected_records", affectedRecs),
+		)
+		recs = affectedRecs
+		return nil
+	})
+
+	if err != nil {
+		return 0, err
+	}
+	return recs, nil
 }
 
 func (p *PipelineService) Close() {
@@ -265,6 +306,7 @@ func (p *PipelineService) Close() {
 	slog.Debug("Service total data",
 		slog.Int64("rejected", p.rejectedCount.Load()),
 		slog.Int64("succed", p.successCount.Load()),
+		slog.Int64("dead_lettered", p.deadLetterCount.Load()),
 	)
 }
 
@@ -395,110 +437,4 @@ func (e *EnricherWorker) enrich(ctx context.Context, event *domain.Event, batchC
 		slog.Duration("duration", time.Since(start)),
 	)
 	return nil
-}
-
-// func (p *PipelineService) batchInsertEvent(ctx context.Context, wg *sync.WaitGroup) {
-// 	defer wg.Done()
-
-// 	duration := time.Duration(3000 * time.Millisecond)
-// 	ticker := time.NewTicker(duration)
-// 	slog.Info("Initiating batchInsert with ticker...",
-// 		slog.Any("ticker", ticker),
-// 	)
-
-// 	events := make([]domain.Event, 0)
-// 	for {
-// 		select {
-// 		case <-ticker.C:
-// 			events = p.checkAndInsertEvents(ctx, events, "timer_ticker", 0)
-// 		case e, ok := <-p.batchChan:
-// 			if !ok {
-// 				slog.Info("Batch channel in pipeline is closed...")
-// 				slog.Info("Checking remaining left data in collections...")
-// 				ticker.Stop()
-// 				_ = p.checkAndInsertEvents(ctx, events, "batch_channel_closed", 0)
-// 				return
-// 			}
-// 			events = append(events, *e)
-// 			events = p.checkAndInsertEvents(ctx, events, "event_arrival", p.insertBatchSize-1)
-// 			// reset ticker to restart the ticker
-// 			ticker.Reset(duration)
-// 		case <-ctx.Done():
-// 			slog.Debug("batchInsert mechanism interrupted",
-// 				slog.Any("err", context.Cause(ctx)))
-// 		}
-// 	}
-
-// }
-
-// func (p *PipelineService) checkAndInsertEvents(ctx context.Context, events []domain.Event, phase string, min int) []domain.Event {
-// 	if len(events) > min {
-// 		slog.Debug("trigger batch insert",
-// 			slog.String("via", phase),
-// 		)
-// 		p.insertEvents(ctx, events)
-// 		clear(events)
-// 		events = events[:0]
-// 	} else {
-// 		slog.Debug("no data exist / not meet the treshold to trigger insert",
-// 			slog.String("via", phase),
-// 		)
-// 	}
-// 	return events
-// }
-
-func (p *PipelineService) insertEvents(ctx context.Context, events []domain.Event) (int64, error) {
-
-	recs := int64(0)
-	err := p.txManager.WithTx(ctx, func(aar port.PipelineRepository) error {
-
-		affectedRecs, err := aar.Event().CreateEvents(ctx, events)
-		if err != nil {
-			slog.Error("create events error", slog.Any("err", err))
-			return err
-		}
-
-		slog.Info("Successfully insertEvents",
-			slog.Int64("affected_records", affectedRecs),
-		)
-		p.successCount.Add(affectedRecs)
-		recs = affectedRecs
-		return nil
-	})
-
-	if err != nil {
-		slog.Error("insertEvents batch process failed",
-			slog.Any("err", err),
-		)
-		return 0, err
-	}
-	return recs, nil
-}
-
-func (p *PipelineService) insertDeadLetterEvents(ctx context.Context, events []domain.Event) (int64, error) {
-
-	recs := int64(0)
-	err := p.txManager.WithTx(ctx, func(pr port.PipelineRepository) error {
-
-		affectedRecs, err := pr.DeadLetterEvent().CreateDeadLetters(ctx, events)
-		if err != nil {
-			slog.Error("insertDeadLetterEvents error", slog.Any("err", err))
-			return err
-		}
-
-		slog.Info("Successfully insert DeadLetterEvents",
-			slog.Int64("affected_records", affectedRecs),
-		)
-		p.successCount.Add(affectedRecs)
-		recs = affectedRecs
-		return nil
-	})
-
-	if err != nil {
-		slog.Error("insertDeadLetterEvents batch process failed",
-			slog.Any("err", err),
-		)
-		return 0, err
-	}
-	return recs, nil
 }
