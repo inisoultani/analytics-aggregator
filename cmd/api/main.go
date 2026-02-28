@@ -78,21 +78,21 @@ func main() {
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	<-stop
 
+	logger.Info("shutting down analytics-aggregator server...")
+	ctx, cancel := context.WithTimeout(mainCtx, 10*time.Second)
+	defer cancel()
+
+	if err := server.Shutdown(ctx); err != nil {
+		logger.Error("server shutdown with error", slog.Any("err", err))
+	} else {
+		logger.Info("server gracefully stopped")
+	}
+
 	// close all channel pipeline
 	logger.Info("closing all channel in the pipeline...")
 	service.Close()
 
 	logger.Info("closing all db connections...")
 	pool.Close()
-
-	logger.Info("shutting down analytics-aggregator server...")
-	ctx, cancel := context.WithTimeout(mainCtx, 10*time.Second)
-	defer cancel()
-
-	if err := server.Shutdown(ctx); err != nil {
-		logger.Error("Listen error", slog.Any("err", err))
-		os.Exit(1)
-	}
-	logger.Info("server gracefully stopped")
 
 }

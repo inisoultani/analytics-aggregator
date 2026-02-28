@@ -106,6 +106,7 @@ func (p *PipelineService) storeWithRetry(ctx context.Context, e *domain.Event, w
 				slog.String("event_id", e.ID.String()),
 				slog.Int("retry_count", e.RetryCount),
 				slog.Any("err", context.Cause(ctx)))
+			return
 		}
 	}
 	p.rejectedCount.Add(1)
@@ -130,6 +131,7 @@ func (p *PipelineService) jobDistributor(ctx context.Context, wg *sync.WaitGroup
 		case <-ctx.Done():
 			slog.Debug("jobDistributor mechanism interrupted",
 				slog.Any("err", context.Cause(ctx)))
+			return
 		}
 	}
 }
@@ -150,12 +152,13 @@ func (p *PipelineService) batchInsert(ctx context.Context, wg *sync.WaitGroup, b
 
 	duration := time.Duration(3000 * time.Millisecond)
 	ticker := time.NewTicker(duration)
+	defer ticker.Stop()
 	slog.Info("Initiating batchInsert with ticker...",
 		slog.String("batch_id", batchName),
 		slog.Duration("tick_duration", duration),
 	)
 
-	events := make([]domain.Event, 0)
+	events := make([]domain.Event, 0, p.insertBatchSize)
 	for {
 		select {
 		case <-ticker.C:
@@ -164,18 +167,23 @@ func (p *PipelineService) batchInsert(ctx context.Context, wg *sync.WaitGroup, b
 			if !ok {
 				slog.Info("Batch channel in pipeline is closed...", slog.String("batch_id", batchName))
 				slog.Info("Checking remaining left data in collections...", slog.String("batch_id", batchName))
-				ticker.Stop()
 				_ = p.checkAndInsert(ctx, events, "batch_channel_closed", 0, batchName, insertAction)
 				return
 			}
 			events = append(events, *e)
 			events = p.checkAndInsert(ctx, events, "event_arrival", p.insertBatchSize-1, batchName, insertAction)
-			// reset ticker to restart the ticker
-			ticker.Reset(duration)
+			// ONLY reset the ticker if we actually flushed the batch
+			// we know a flush happened if checkAndInsert reduced the length to 0
+			if len(events) == 0 {
+				ticker.Reset(duration)
+			}
 		case <-ctx.Done():
 			slog.Debug("batchInsert mechanism interrupted",
 				slog.String("batch_id", batchName),
 				slog.Any("err", context.Cause(ctx)))
+			// flush remaining data before exit this func to ensure no data loss
+			_ = p.checkAndInsert(context.Background(), events, "batch_channel_interrupted", 0, batchName, insertAction)
+			return
 		}
 	}
 }
@@ -392,6 +400,7 @@ func (e *EnricherWorker) enrichWithRetry(ctx context.Context, event *domain.Even
 					slog.String("event_id", event.ID.String()),
 					slog.Int("retry_count", event.RetryCount),
 					slog.Any("err", context.Cause(ctx)))
+				return
 			case <-time.After(retryDuration):
 				err := e.enrich(apiCtx, event, batchChan)
 				if err == nil {
