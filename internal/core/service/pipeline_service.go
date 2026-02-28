@@ -376,19 +376,12 @@ func (e *EnricherWorker) DataEnricherProcess(ctx context.Context, id int, batchC
 }
 
 func (e *EnricherWorker) enrichWithRetry(ctx context.Context, event *domain.Event, batchChan chan<- *domain.Event, deadLetterChan chan<- *domain.Event) {
-	// intentionally use different context for each api call
-	// to ensure no data loss during enrichment process by
-	// avoid context-cancelled during api call process
-	timeout := time.Duration(1000 * time.Millisecond)
-	cause := fmt.Errorf("api call timeout, waiting time was : %dms", timeout.Milliseconds())
-	apiCtx, cancelFunc := context.WithTimeoutCause(context.Background(), timeout, cause)
-	defer cancelFunc()
 
-	err := e.enrich(apiCtx, event, batchChan)
+	err := e.enrich(ctx, event, batchChan)
 	if err != nil {
 		slog.Debug("Enrich process error, entering retry flow",
 			slog.String("event_id", event.ID.String()),
-			slog.Any("err", context.Cause(apiCtx)),
+			slog.Any("err", err),
 		)
 		event.RetryCount = 0
 		for event.RetryCount < 3 {
@@ -396,13 +389,21 @@ func (e *EnricherWorker) enrichWithRetry(ctx context.Context, event *domain.Even
 			retryDuration := time.Duration(event.RetryCount*2) * time.Second
 			select {
 			case <-ctx.Done():
-				slog.Debug("EnrichWithRetry mechanism interrupted",
+				msg := "EnrichWithRetry mechanism interrupted"
+				slog.Debug(msg,
 					slog.String("event_id", event.ID.String()),
 					slog.Int("retry_count", event.RetryCount),
 					slog.Any("err", context.Cause(ctx)))
+				// push to dead letter to avoid message loss, probably triggered during shutdown
+				event.ErrorReason = fmt.Sprintf(msg+", event_id: %s, retry_count: %d", event.ID.String(), event.RetryCount)
+				// since the origin ctx alread cancelled here, we create "last-breath" ctx
+				// to ensure event had the time to reach DLQ
+				lastBreathCtx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+				defer cancel()
+				e.sendToDLQ(lastBreathCtx, event, deadLetterChan)
 				return
 			case <-time.After(retryDuration):
-				err := e.enrich(apiCtx, event, batchChan)
+				err := e.enrich(ctx, event, batchChan)
 				if err == nil {
 					return
 				}
@@ -420,15 +421,37 @@ func (e *EnricherWorker) enrichWithRetry(ctx context.Context, event *domain.Even
 			slog.Any("err", err),
 		)
 		event.ErrorReason = err.Error()
-		deadLetterChan <- event
+		e.sendToDLQ(ctx, event, deadLetterChan)
 	}
 
+}
+
+func (e *EnricherWorker) sendToDLQ(ctx context.Context, event *domain.Event, deadLetterChan chan<- *domain.Event) {
+	select {
+	case <-ctx.Done():
+		slog.Warn("Pipeline shutting down, failed to drop message to DLQ",
+			slog.Any("event", event),
+		)
+	case deadLetterChan <- event:
+		slog.Debug("EnricherWorker send event to DLQ",
+			slog.Int("id", e.id),
+			slog.String("event_id", event.ID.String()),
+		)
+	}
 }
 
 func (e *EnricherWorker) enrich(ctx context.Context, event *domain.Event, batchChan chan<- *domain.Event) error {
 	start := time.Now()
 
-	enrichData, err := e.dataEnricher.EnrichIp(ctx, event.ClientIP)
+	// intentionally use different context for each api call
+	// since on each attempt, it will already marked as Canceled (DeadlineExceeded).
+	// to ensure no data loss during enrichment process by
+	timeout := time.Duration(10 * time.Millisecond)
+	cause := fmt.Errorf("api call timeout, waiting time was : %dms", timeout.Milliseconds())
+	apiCtx, cancelFunc := context.WithTimeoutCause(context.Background(), timeout, cause)
+	defer cancelFunc()
+
+	enrichData, err := e.dataEnricher.EnrichIp(apiCtx, event.ClientIP)
 	if err != nil {
 		slog.Error("Failed to fetch enrich data",
 			slog.Int("id", e.id),
@@ -439,11 +462,19 @@ func (e *EnricherWorker) enrich(ctx context.Context, event *domain.Event, batchC
 		return err
 	}
 	event.EnrichedData = enrichData
-	batchChan <- event
-	slog.Debug("EnricherWorker finish enriching data",
-		slog.Int("id", e.id),
-		slog.String("event_id", event.ID.String()),
-		slog.Duration("duration", time.Since(start)),
-	)
+
+	select {
+	case <-ctx.Done():
+		slog.Warn("Pipeline shutting down, failed to drop message to batch channel",
+			slog.Any("event", event),
+		)
+	case batchChan <- event:
+		slog.Debug("EnricherWorker finish enriching data",
+			slog.Int("id", e.id),
+			slog.String("event_id", event.ID.String()),
+			slog.Duration("duration", time.Since(start)),
+		)
+	}
+
 	return nil
 }

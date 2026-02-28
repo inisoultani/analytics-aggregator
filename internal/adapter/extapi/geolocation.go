@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"time"
 )
@@ -58,7 +59,13 @@ func (g *GeoAPIClient) EnrichIp(ctx context.Context, ip string) ([]byte, error) 
 		return nil, fmt.Errorf("failed to create request, %w", err)
 	}
 
+	start := time.Now()
 	resp, err := g.client.Do(req)
+	duration := time.Since(start)
+	slog.Debug("request finished",
+		slog.String("ip", ip),
+		slog.Duration("duration", duration),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("external api request failed, %w", err)
 	}
