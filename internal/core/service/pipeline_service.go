@@ -106,10 +106,18 @@ func (p *PipelineService) storeWithRetry(ctx context.Context, e *domain.Event, w
 				slog.String("event_id", e.ID.String()),
 				slog.Int("retry_count", e.RetryCount),
 				slog.Any("err", context.Cause(ctx)))
+			e.ErrorReason = "pipeline_store_with_retry_closed"
+			// since the origin ctx alread cancelled here, we create "last-breath" ctx
+			// to ensure event had the time to reach DLQ
+			lastBreathCtx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+			defer cancel()
+			sendToDLQ(lastBreathCtx, e, e.ErrorReason, p.deadLetterChan)
 			return
 		}
 	}
 	p.rejectedCount.Add(1)
+	e.ErrorReason = "pipeline_store_with_retry_maxed"
+	sendToDLQ(ctx, e, e.ErrorReason, p.deadLetterChan)
 }
 
 func (p *PipelineService) jobDistributor(ctx context.Context, wg *sync.WaitGroup) {
@@ -400,7 +408,7 @@ func (e *EnricherWorker) enrichWithRetry(ctx context.Context, event *domain.Even
 				// to ensure event had the time to reach DLQ
 				lastBreathCtx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 				defer cancel()
-				e.sendToDLQ(lastBreathCtx, event, deadLetterChan)
+				sendToDLQ(lastBreathCtx, event, "enricher_worker", deadLetterChan)
 				return
 			case <-time.After(retryDuration):
 				err := e.enrich(ctx, event, batchChan)
@@ -421,20 +429,21 @@ func (e *EnricherWorker) enrichWithRetry(ctx context.Context, event *domain.Even
 			slog.Any("err", err),
 		)
 		event.ErrorReason = err.Error()
-		e.sendToDLQ(ctx, event, deadLetterChan)
+		sendToDLQ(ctx, event, "enricher_worker", deadLetterChan)
 	}
 
 }
 
-func (e *EnricherWorker) sendToDLQ(ctx context.Context, event *domain.Event, deadLetterChan chan<- *domain.Event) {
+func sendToDLQ(ctx context.Context, event *domain.Event, processName string, deadLetterChan chan<- *domain.Event) {
 	select {
 	case <-ctx.Done():
 		slog.Warn("Pipeline shutting down, failed to drop message to DLQ",
+			slog.String("process_name", processName),
 			slog.Any("event", event),
 		)
 	case deadLetterChan <- event:
-		slog.Debug("EnricherWorker send event to DLQ",
-			slog.Int("id", e.id),
+		slog.Debug("Send event to DLQ",
+			slog.String("process_name", processName),
 			slog.String("event_id", event.ID.String()),
 		)
 	}
@@ -467,7 +476,9 @@ func (e *EnricherWorker) enrich(ctx context.Context, event *domain.Event, batchC
 	case <-ctx.Done():
 		slog.Warn("Pipeline shutting down, failed to drop message to batch channel",
 			slog.Any("event", event),
+			slog.Any("err", context.Cause(ctx)),
 		)
+		return context.Cause(ctx)
 	case batchChan <- event:
 		slog.Debug("EnricherWorker finish enriching data",
 			slog.Int("id", e.id),
