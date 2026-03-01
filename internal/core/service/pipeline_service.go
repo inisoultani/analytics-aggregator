@@ -15,6 +15,7 @@ import (
 type insertAction func(context.Context, []domain.Event, string) (int64, error)
 
 type PipelineService struct {
+	notifyCtx        context.Context
 	txManager        port.TxManager
 	dataEnricher     port.DataEnricher
 	enrichWorkerSize int
@@ -37,6 +38,7 @@ type PipelineService struct {
 func NewPipelineService(ctx context.Context, txManager port.TxManager, de port.DataEnricher, cfg *config.Config) *PipelineService {
 	// initiating pipeline service
 	s := &PipelineService{
+		notifyCtx:        ctx,
 		txManager:        txManager,
 		dataEnricher:     de,
 		workerPoolChan:   make(chan *EnricherWorker, cfg.EnricherWorkerSize),
@@ -77,8 +79,7 @@ func NewPipelineService(ctx context.Context, txManager port.TxManager, de port.D
 
 func (p *PipelineService) ProcessAndStore(ctx context.Context, e *domain.Event) (int64, error) {
 	p.wgStoreRetry.Add(1)
-	ctx = context.WithoutCancel(ctx)
-	go p.storeWithRetry(ctx, e, &p.wgStoreRetry)
+	go p.storeWithRetry(p.notifyCtx, e, &p.wgStoreRetry)
 
 	return 1, nil
 }
@@ -108,16 +109,16 @@ func (p *PipelineService) storeWithRetry(ctx context.Context, e *domain.Event, w
 				slog.Any("err", context.Cause(ctx)))
 			e.ErrorReason = "pipeline_store_with_retry_closed"
 			// since the origin ctx alread cancelled here, we create "last-breath" ctx
-			// to ensure event had the time to reach DLQ
+			// to ensure event had the time to reach DLE
 			lastBreathCtx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 			defer cancel()
-			sendToDLQ(lastBreathCtx, e, e.ErrorReason, p.deadLetterChan)
+			sendToDLE(lastBreathCtx, e, e.ErrorReason, p.deadLetterChan)
 			return
 		}
 	}
 	p.rejectedCount.Add(1)
 	e.ErrorReason = "pipeline_store_with_retry_maxed"
-	sendToDLQ(ctx, e, e.ErrorReason, p.deadLetterChan)
+	sendToDLE(ctx, e, e.ErrorReason, p.deadLetterChan)
 }
 
 func (p *PipelineService) jobDistributor(ctx context.Context, wg *sync.WaitGroup) {
@@ -405,10 +406,10 @@ func (e *EnricherWorker) enrichWithRetry(ctx context.Context, event *domain.Even
 				// push to dead letter to avoid message loss, probably triggered during shutdown
 				event.ErrorReason = fmt.Sprintf(msg+", event_id: %s, retry_count: %d", event.ID.String(), event.RetryCount)
 				// since the origin ctx alread cancelled here, we create "last-breath" ctx
-				// to ensure event had the time to reach DLQ
+				// to ensure event had the time to reach DLE
 				lastBreathCtx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 				defer cancel()
-				sendToDLQ(lastBreathCtx, event, "enricher_worker", deadLetterChan)
+				sendToDLE(lastBreathCtx, event, "enricher_worker", deadLetterChan)
 				return
 			case <-time.After(retryDuration):
 				err := e.enrich(ctx, event, batchChan)
@@ -422,27 +423,27 @@ func (e *EnricherWorker) enrichWithRetry(ctx context.Context, event *domain.Even
 				)
 			}
 		}
-		// TODO if after multiple retry stil failed, push to deadletter pipeline
+		// if after multiple retry stil failed, push to deadletter pipeline
 		slog.Debug("Enrich retry reach max attempts, will send the event to DLE",
 			slog.String("event_id", event.ID.String()),
 			slog.Int("retry_count", event.RetryCount),
 			slog.Any("err", err),
 		)
 		event.ErrorReason = err.Error()
-		sendToDLQ(ctx, event, "enricher_worker", deadLetterChan)
+		sendToDLE(ctx, event, "enricher_worker", deadLetterChan)
 	}
 
 }
 
-func sendToDLQ(ctx context.Context, event *domain.Event, processName string, deadLetterChan chan<- *domain.Event) {
+func sendToDLE(ctx context.Context, event *domain.Event, processName string, deadLetterChan chan<- *domain.Event) {
 	select {
 	case <-ctx.Done():
-		slog.Warn("Pipeline shutting down, failed to drop message to DLQ",
+		slog.Warn("Pipeline shutting down, failed to drop message to DLE",
 			slog.String("process_name", processName),
 			slog.Any("event", event),
 		)
 	case deadLetterChan <- event:
-		slog.Debug("Send event to DLQ",
+		slog.Debug("Send event to DLE",
 			slog.String("process_name", processName),
 			slog.String("event_id", event.ID.String()),
 		)

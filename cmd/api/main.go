@@ -53,10 +53,13 @@ func main() {
 	}
 	defer pool.Close()
 
+	// channel to block runtime and wait for shutdown signal
+	notifyCtx, cancel := signal.NotifyContext(mainCtx, syscall.SIGINT, syscall.SIGTERM)
+
 	// initate core
 	txManager := repository.NewPostgresTxManager(pool)
 	geoApiClient := extapi.NewGeoAPIClient(cfg.GeoAPIBaseURL)
-	service := service.NewPipelineService(mainCtx, txManager, geoApiClient, cfg)
+	service := service.NewPipelineService(notifyCtx, txManager, geoApiClient, cfg)
 
 	// initiate app
 	addr := ":" + cfg.ServerPort
@@ -73,10 +76,10 @@ func main() {
 		}
 	}()
 
-	// channel to block runtime and wait for shutdown signal
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
-	<-stop
+	select {
+	case <-notifyCtx.Done():
+		logger.Info("Shutdown signal received")
+	}
 
 	logger.Info("shutting down analytics-aggregator server...")
 	ctx, cancel := context.WithTimeout(mainCtx, 10*time.Second)
