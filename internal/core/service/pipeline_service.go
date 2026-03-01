@@ -113,7 +113,7 @@ func (p *PipelineService) storeWithRetry(ctx context.Context, e *domain.Event, w
 					slog.Int("retry_count", e.RetryCount),
 					slog.Any("err", context.Cause(attempCtx)),
 				)
-				p.lastBreathToDLE("pipeline_store_attemptCtx_closed", e)
+				lastBreathToDLE("pipeline_store_attemptCtx_closed", e, p.deadLetterChan)
 				return
 			}
 		}
@@ -134,22 +134,13 @@ func (p *PipelineService) storeWithRetry(ctx context.Context, e *domain.Event, w
 				slog.String("event_id", e.ID.String()),
 				slog.Int("retry_count", e.RetryCount),
 				slog.Any("err", context.Cause(ctx)))
-			p.lastBreathToDLE("pipeline_store_with_retry_closed", e)
+			lastBreathToDLE("pipeline_store_with_retry_closed", e, p.deadLetterChan)
 			return
 		}
 	}
 	p.rejectedCount.Add(1)
 	e.ErrorReason = "pipeline_store_with_retry_maxed"
 	sendToDLE(ctx, e, e.ErrorReason, p.deadLetterChan)
-}
-
-func (p *PipelineService) lastBreathToDLE(reason string, e *domain.Event) {
-	e.ErrorReason = reason
-	// since the origin ctx alread cancelled here, we create "last-breath" ctx
-	// to ensure event had the time to reach DLE
-	lastBreathCtx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-	defer cancel()
-	sendToDLE(lastBreathCtx, e, e.ErrorReason, p.deadLetterChan)
 }
 
 func (p *PipelineService) jobDistributor(ctx context.Context, wg *sync.WaitGroup) {
@@ -435,12 +426,7 @@ func (e *EnricherWorker) enrichWithRetry(ctx context.Context, event *domain.Even
 					slog.Int("retry_count", event.RetryCount),
 					slog.Any("err", context.Cause(ctx)))
 				// push to dead letter to avoid message loss, probably triggered during shutdown
-				event.ErrorReason = fmt.Sprintf(msg+", event_id: %s, retry_count: %d", event.ID.String(), event.RetryCount)
-				// since the origin ctx alread cancelled here, we create "last-breath" ctx
-				// to ensure event had the time to reach DLE
-				lastBreathCtx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-				defer cancel()
-				sendToDLE(lastBreathCtx, event, "enricher_worker", deadLetterChan)
+				lastBreathToDLE(fmt.Sprintf(msg+", event_id: %s, retry_count: %d", event.ID.String(), event.RetryCount), event, deadLetterChan)
 				return
 			case <-time.After(retryDuration):
 				err := e.enrich(ctx, event, batchChan)
@@ -464,6 +450,15 @@ func (e *EnricherWorker) enrichWithRetry(ctx context.Context, event *domain.Even
 		sendToDLE(ctx, event, "enricher_worker", deadLetterChan)
 	}
 
+}
+
+func lastBreathToDLE(reason string, e *domain.Event, deadLetterChan chan<- *domain.Event) {
+	e.ErrorReason = reason
+	// since the origin ctx alread cancelled here, we create "last-breath" ctx
+	// to ensure event had the time to reach DLE
+	lastBreathCtx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+	sendToDLE(lastBreathCtx, e, e.ErrorReason, deadLetterChan)
 }
 
 func sendToDLE(ctx context.Context, event *domain.Event, processName string, deadLetterChan chan<- *domain.Event) {
