@@ -158,7 +158,7 @@ func (p *PipelineService) jobDistributor(ctx context.Context, wg *sync.WaitGroup
 				)
 				return
 			}
-			p.assignWorker(e)
+			p.assignWorker(ctx, e)
 		case <-ctx.Done():
 			slog.Debug("jobDistributor mechanism interrupted",
 				slog.Any("err", context.Cause(ctx)))
@@ -167,15 +167,40 @@ func (p *PipelineService) jobDistributor(ctx context.Context, wg *sync.WaitGroup
 	}
 }
 
-func (p *PipelineService) assignWorker(e *domain.Event) {
+func (p *PipelineService) assignWorker(ctx context.Context, e *domain.Event) {
 	// defer wg.Done()
 
-	time.Sleep(1 * time.Second)
+	// time.Sleep(1 * time.Second)
 	slog.Debug("assignWorker processing event",
 		slog.String("event_id", e.ID.String()),
 	)
-	ew := <-p.workerPoolChan
-	ew.jobChan <- e
+	// ew := <-p.workerPoolChan
+	var worker *EnricherWorker
+	select {
+	case ew := <-p.workerPoolChan:
+		// worker succesfully acquired
+		worker = ew
+	case <-ctx.Done():
+		slog.Debug("get worker in assignWorker failed",
+			slog.String("event_id", e.ID.String()),
+			slog.Any("err", context.Cause(ctx)),
+		)
+		lastBreathToDLE("get_worker_failed_context_closed", e, p.deadLetterChan)
+		return
+	}
+
+	// ew.jobChan <- e
+	select {
+	case worker.jobChan <- e:
+		// job succesfully handed to worker channel
+	case <-ctx.Done():
+		slog.Debug("assignWorker job failed",
+			slog.String("event_id", e.ID.String()),
+			slog.Any("err", context.Cause(ctx)),
+		)
+		lastBreathToDLE("assign_worker_job_failed_context_closed", e, p.deadLetterChan)
+		return
+	}
 }
 
 func (p *PipelineService) batchInsert(ctx context.Context, wg *sync.WaitGroup, batchName string, c <-chan *domain.Event, insertAction insertAction) {
