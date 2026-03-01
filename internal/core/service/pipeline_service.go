@@ -16,7 +16,7 @@ import (
 type insertAction func(context.Context, []domain.Event, string) (int64, error)
 
 type PipelineService struct {
-	notifyCtx        context.Context
+	mainCtx          context.Context
 	txManager        port.TxManager
 	dataEnricher     port.DataEnricher
 	enrichWorkerSize int
@@ -39,7 +39,7 @@ type PipelineService struct {
 func NewPipelineService(ctx context.Context, txManager port.TxManager, de port.DataEnricher, cfg *config.Config) *PipelineService {
 	// initiating pipeline service
 	s := &PipelineService{
-		notifyCtx:        ctx,
+		mainCtx:          ctx,
 		txManager:        txManager,
 		dataEnricher:     de,
 		workerPoolChan:   make(chan *EnricherWorker, cfg.EnricherWorkerSize),
@@ -81,10 +81,10 @@ func NewPipelineService(ctx context.Context, txManager port.TxManager, de port.D
 func (p *PipelineService) ProcessAndStore(ctx context.Context, e *domain.Event) (int64, error) {
 	p.wgStoreRetry.Add(1)
 
-	// we use notify context from the main flow
+	// we use main context from the main flow
 	// to ensure go routines in pipeline service survive the http response
 	// and still aware of application level shutdown signal
-	go p.storeWithRetry(p.notifyCtx, e, &p.wgStoreRetry)
+	go p.storeWithRetry(p.mainCtx, e, &p.wgStoreRetry)
 
 	return 1, nil
 }
