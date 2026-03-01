@@ -452,30 +452,6 @@ func (e *EnricherWorker) enrichWithRetry(ctx context.Context, event *domain.Even
 
 }
 
-func lastBreathToDLE(reason string, e *domain.Event, deadLetterChan chan<- *domain.Event) {
-	e.ErrorReason = reason
-	// since the origin ctx alread cancelled here, we create "last-breath" ctx
-	// to ensure event had the time to reach DLE
-	lastBreathCtx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-	defer cancel()
-	sendToDLE(lastBreathCtx, e, e.ErrorReason, deadLetterChan)
-}
-
-func sendToDLE(ctx context.Context, event *domain.Event, processName string, deadLetterChan chan<- *domain.Event) {
-	select {
-	case <-ctx.Done():
-		slog.Warn("Pipeline shutting down, failed to drop message to DLE",
-			slog.String("process_name", processName),
-			slog.Any("event", event),
-		)
-	case deadLetterChan <- event:
-		slog.Debug("Send event to DLE",
-			slog.String("process_name", processName),
-			slog.String("event_id", event.ID.String()),
-		)
-	}
-}
-
 func (e *EnricherWorker) enrich(ctx context.Context, event *domain.Event, batchChan chan<- *domain.Event) error {
 	start := time.Now()
 
@@ -515,4 +491,28 @@ func (e *EnricherWorker) enrich(ctx context.Context, event *domain.Event, batchC
 	}
 
 	return nil
+}
+
+func lastBreathToDLE(reason string, e *domain.Event, deadLetterChan chan<- *domain.Event) {
+	e.ErrorReason = reason
+	// since the origin ctx alread cancelled here, we create "last-breath" ctx
+	// to ensure event had the time to reach DLE
+	lastBreathCtx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+	sendToDLE(lastBreathCtx, e, e.ErrorReason, deadLetterChan)
+}
+
+func sendToDLE(ctx context.Context, event *domain.Event, processName string, deadLetterChan chan<- *domain.Event) {
+	select {
+	case <-ctx.Done():
+		slog.Warn("Pipeline shutting down, failed to drop message to DLE",
+			slog.String("process_name", processName),
+			slog.Any("event", event),
+		)
+	case deadLetterChan <- event:
+		slog.Debug("Send event to DLE",
+			slog.String("process_name", processName),
+			slog.String("event_id", event.ID.String()),
+		)
+	}
 }
