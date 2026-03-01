@@ -43,12 +43,12 @@ func NewPipelineService(ctx context.Context, txManager port.TxManager, de port.D
 		txManager:        txManager,
 		dataEnricher:     de,
 		workerPoolChan:   make(chan *EnricherWorker, cfg.EnricherWorkerSize),
-		batchChan:        make(chan *domain.Event),
 		pipelineJobChan:  make(chan *domain.Event, cfg.PipelineJobSize),
 		insertBatchSize:  cfg.InsertBatchSize,
 		enrichWorkerSize: cfg.EnricherWorkerSize,
 		enrichWorkerList: []*EnricherWorker{},
-		deadLetterChan:   make(chan *domain.Event),
+		batchChan:        make(chan *domain.Event, cfg.InsertBatchSize),
+		deadLetterChan:   make(chan *domain.Event, cfg.InsertBatchSize),
 	}
 	// initiating workers during service initiation
 	for i := range cfg.EnricherWorkerSize {
@@ -391,6 +391,7 @@ func (e *EnricherWorker) DataEnricherProcess(ctx context.Context, id int, batchC
 	inPool := false
 	tickerDuration := time.Duration(5 * time.Second)
 	ticker := time.NewTicker(tickerDuration)
+	defer ticker.Stop()
 	for {
 		if !inPool {
 			select {
@@ -402,7 +403,6 @@ func (e *EnricherWorker) DataEnricherProcess(ctx context.Context, id int, batchC
 				return
 			case workerPool <- e:
 				inPool = true
-
 			}
 		}
 
@@ -415,8 +415,14 @@ func (e *EnricherWorker) DataEnricherProcess(ctx context.Context, id int, batchC
 				return
 			}
 			inPool = false
-			ticker.Reset(tickerDuration)
 			e.enrichWithRetry(ctx, event, batchChan, deadLetterChan)
+			ticker.Reset(tickerDuration)
+
+			// drain the ticker, remove any stale tick while the worker busy previously
+			select {
+			case <-ticker.C:
+			default:
+			}
 		case <-ticker.C:
 			slog.Debug("EnricherWorker done sleeping, still waiting for job...",
 				slog.Int("id", id),
