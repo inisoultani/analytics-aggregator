@@ -5,6 +5,7 @@ import (
 	"analytics-aggregator/internal/core/domain"
 	"analytics-aggregator/internal/core/port"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -79,6 +80,10 @@ func NewPipelineService(ctx context.Context, txManager port.TxManager, de port.D
 
 func (p *PipelineService) ProcessAndStore(ctx context.Context, e *domain.Event) (int64, error) {
 	p.wgStoreRetry.Add(1)
+
+	// we use notify context from the main flow
+	// to ensure go routines in pipeline service survive the http response
+	// and still aware of application level shutdown signal
 	go p.storeWithRetry(p.notifyCtx, e, &p.wgStoreRetry)
 
 	return 1, nil
@@ -88,37 +93,63 @@ func (p *PipelineService) storeWithRetry(ctx context.Context, e *domain.Event, w
 	defer wg.Done()
 
 	for e.RetryCount < 3 {
-		e.RetryCount++
-		retryDuration := time.Duration(e.RetryCount*2) * time.Second
+
+		attempCtx, cancelAttempt := context.WithTimeout(ctx, 100*time.Millisecond)
 		select {
 		case p.pipelineJobChan <- e:
+			cancelAttempt()
 			slog.Debug("storeWithRetry success",
 				slog.String("event_id", e.ID.String()),
 				slog.Int("retry_count", e.RetryCount))
 			return
+
+		case <-attempCtx.Done():
+			cancelAttempt()
+			// if context.DeadlineExceeded -> channel is geneuinely full (backpressure effect)
+			// if context.Cancelled -> channel receive signal shutdown from the main flow
+			if errors.Is(context.Cause(attempCtx), context.Canceled) {
+				slog.Debug("storeWithRetry attempCtx interrupted",
+					slog.String("event_id", e.ID.String()),
+					slog.Int("retry_count", e.RetryCount),
+					slog.Any("err", context.Cause(attempCtx)),
+				)
+				p.lastBreathToDLE("pipeline_store_attemptCtx_closed", e)
+				return
+			}
+		}
+
+		// retry flow
+		e.RetryCount++
+		retryDuration := time.Duration(e.RetryCount*2) * time.Second
+		select {
 		case <-time.After(retryDuration):
 			slog.Debug("Failed to store data into the pipeline",
 				slog.String("event_id", e.ID.String()),
 				slog.Int("retry_count", e.RetryCount),
 				slog.Duration("retry_backoff_time", retryDuration),
 				slog.Any("err", domain.ErrFailedToPushToPipeline))
+			continue
 		case <-ctx.Done():
 			slog.Debug("storeWithRetry mechanism interrupted",
 				slog.String("event_id", e.ID.String()),
 				slog.Int("retry_count", e.RetryCount),
 				slog.Any("err", context.Cause(ctx)))
-			e.ErrorReason = "pipeline_store_with_retry_closed"
-			// since the origin ctx alread cancelled here, we create "last-breath" ctx
-			// to ensure event had the time to reach DLE
-			lastBreathCtx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-			defer cancel()
-			sendToDLE(lastBreathCtx, e, e.ErrorReason, p.deadLetterChan)
+			p.lastBreathToDLE("pipeline_store_with_retry_closed", e)
 			return
 		}
 	}
 	p.rejectedCount.Add(1)
 	e.ErrorReason = "pipeline_store_with_retry_maxed"
 	sendToDLE(ctx, e, e.ErrorReason, p.deadLetterChan)
+}
+
+func (p *PipelineService) lastBreathToDLE(reason string, e *domain.Event) {
+	e.ErrorReason = reason
+	// since the origin ctx alread cancelled here, we create "last-breath" ctx
+	// to ensure event had the time to reach DLE
+	lastBreathCtx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+	sendToDLE(lastBreathCtx, e, e.ErrorReason, p.deadLetterChan)
 }
 
 func (p *PipelineService) jobDistributor(ctx context.Context, wg *sync.WaitGroup) {
