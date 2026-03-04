@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -415,7 +416,7 @@ func (e *EnricherWorker) DataEnricherProcess(ctx context.Context, id int, batchC
 				return
 			}
 			inPool = false
-			e.enrichWithRetry(ctx, event, batchChan, deadLetterChan)
+			e.enriceWithPanihcHandling(ctx, event, batchChan, deadLetterChan)
 			ticker.Reset(tickerDuration)
 
 			// drain the ticker, remove any stale tick while the worker busy previously
@@ -435,6 +436,27 @@ func (e *EnricherWorker) DataEnricherProcess(ctx context.Context, id int, batchC
 			return
 		}
 	}
+}
+
+func (e *EnricherWorker) enriceWithPanihcHandling(ctx context.Context, event *domain.Event, batch chan<- *domain.Event, dlc chan<- *domain.Event) {
+
+	// handle panic here
+	defer func() {
+		if r := recover(); r != nil {
+			stack := debug.Stack()
+
+			slog.Error("worker caught panic, shielding worker pool..,",
+				slog.String("event_id", event.ID.String()),
+				slog.Any("stack", string(stack)),
+				slog.Any("panic_reason", r),
+			)
+
+			reason := fmt.Sprintf("Panic : %v, stack : %v", r, string(stack))
+			lastBreathToDLE(reason, event, dlc)
+		}
+	}()
+
+	e.enrichWithRetry(ctx, event, batch, dlc)
 }
 
 func (e *EnricherWorker) enrichWithRetry(ctx context.Context, event *domain.Event, batchChan chan<- *domain.Event, deadLetterChan chan<- *domain.Event) {
@@ -485,6 +507,10 @@ func (e *EnricherWorker) enrichWithRetry(ctx context.Context, event *domain.Even
 
 func (e *EnricherWorker) enrich(ctx context.Context, event *domain.Event, batchChan chan<- *domain.Event) error {
 	start := time.Now()
+
+	if start.Second()%2 == 0 {
+		panic("this is random panic during enrichWithRetry execution")
+	}
 
 	// intentionally use different context for each api call
 	// since on each attempt, it will already marked as Canceled (DeadlineExceeded).
