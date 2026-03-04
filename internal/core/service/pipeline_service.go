@@ -508,10 +508,6 @@ func (e *EnricherWorker) enrichWithRetry(ctx context.Context, event *domain.Even
 func (e *EnricherWorker) enrich(ctx context.Context, event *domain.Event, batchChan chan<- *domain.Event) error {
 	start := time.Now()
 
-	if start.Second()%2 == 0 {
-		panic("this is random panic during enrichWithRetry execution")
-	}
-
 	// intentionally use different context for each api call
 	// since on each attempt, it will already marked as Canceled (DeadlineExceeded).
 	// to ensure no data loss during enrichment process by
