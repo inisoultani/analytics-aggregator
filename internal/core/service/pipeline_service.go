@@ -55,14 +55,17 @@ func NewPipelineService(ctx context.Context, txManager port.TxManager, de port.D
 	for i := range cfg.EnricherWorkerSize {
 		workerCtx, workerCancelFunc := context.WithCancelCause(ctx)
 		w := &EnricherWorker{
-			id:           i + 1,
-			jobChan:      make(chan *domain.Event),
-			dataEnricher: s.dataEnricher,
-			cancelFunc:   workerCancelFunc,
+			id:             i + 1,
+			jobChan:        make(chan *domain.Event),
+			dataEnricher:   s.dataEnricher,
+			cancelFunc:     workerCancelFunc,
+			batchChan:      s.batchChan,
+			workerPool:     s.workerPoolChan,
+			deadLetterChan: s.deadLetterChan,
 		}
 		s.enrichWorkerList = append(s.enrichWorkerList, w)
 		s.wgWorker.Add(1)
-		go w.DataEnricherProcess(workerCtx, i+1, s.batchChan, s.workerPoolChan, s.deadLetterChan, &s.wgWorker)
+		go w.DataEnricherProcess(workerCtx, &s.wgWorker)
 	}
 
 	// initiating job distributor
@@ -376,17 +379,20 @@ func (p *PipelineService) Close() {
 }
 
 type EnricherWorker struct {
-	id           int
-	jobChan      chan *domain.Event
-	dataEnricher port.DataEnricher
-	cancelFunc   context.CancelCauseFunc
+	id             int
+	jobChan        chan *domain.Event
+	dataEnricher   port.DataEnricher
+	cancelFunc     context.CancelCauseFunc
+	batchChan      chan<- *domain.Event
+	workerPool     chan<- *EnricherWorker
+	deadLetterChan chan<- *domain.Event
 }
 
-func (e *EnricherWorker) DataEnricherProcess(ctx context.Context, id int, batchChan chan<- *domain.Event, workerPool chan<- *EnricherWorker, deadLetterChan chan<- *domain.Event, wg *sync.WaitGroup) {
+func (e *EnricherWorker) DataEnricherProcess(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	slog.Info("EnricherWorker initiating",
-		slog.Int("id", id),
+		slog.Int("id", e.id),
 	)
 
 	inPool := false
@@ -398,11 +404,11 @@ func (e *EnricherWorker) DataEnricherProcess(ctx context.Context, id int, batchC
 			select {
 			case <-ctx.Done():
 				slog.Info("EnricherWorker interrupted during entering workerPool",
-					slog.Int("id", id),
+					slog.Int("id", e.id),
 					slog.Any("caused_by", context.Cause(ctx)),
 				)
 				return
-			case workerPool <- e:
+			case e.workerPool <- e:
 				inPool = true
 			}
 		}
@@ -411,12 +417,12 @@ func (e *EnricherWorker) DataEnricherProcess(ctx context.Context, id int, batchC
 		case event, ok := <-e.jobChan:
 			if !ok {
 				slog.Info("EnricherWorker has complete its duty, shuting down the worker now",
-					slog.Int("id", id),
+					slog.Int("id", e.id),
 				)
 				return
 			}
 			inPool = false
-			e.enriceWithPanihcHandling(ctx, event, batchChan, deadLetterChan)
+			e.enriceWithPanihcHandling(ctx, event)
 			ticker.Reset(tickerDuration)
 
 			// drain the ticker, remove any stale tick while the worker busy previously
@@ -426,11 +432,11 @@ func (e *EnricherWorker) DataEnricherProcess(ctx context.Context, id int, batchC
 			}
 		case <-ticker.C:
 			slog.Debug("EnricherWorker done sleeping, still waiting for job...",
-				slog.Int("id", id),
+				slog.Int("id", e.id),
 			)
 		case <-ctx.Done():
 			slog.Info("EnricherWorker interrupted",
-				slog.Int("id", id),
+				slog.Int("id", e.id),
 				slog.Any("caused_by", context.Cause(ctx)),
 			)
 			return
@@ -438,7 +444,7 @@ func (e *EnricherWorker) DataEnricherProcess(ctx context.Context, id int, batchC
 	}
 }
 
-func (e *EnricherWorker) enriceWithPanihcHandling(ctx context.Context, event *domain.Event, batch chan<- *domain.Event, dlc chan<- *domain.Event) {
+func (e *EnricherWorker) enriceWithPanihcHandling(ctx context.Context, event *domain.Event) {
 
 	// handle panic here
 	defer func() {
@@ -452,16 +458,16 @@ func (e *EnricherWorker) enriceWithPanihcHandling(ctx context.Context, event *do
 			)
 
 			reason := fmt.Sprintf("Panic : %v, stack : %v", r, string(stack))
-			lastBreathToDLE(reason, event, dlc)
+			lastBreathToDLE(reason, event, e.deadLetterChan)
 		}
 	}()
 
-	e.enrichWithRetry(ctx, event, batch, dlc)
+	e.enrichWithRetry(ctx, event)
 }
 
-func (e *EnricherWorker) enrichWithRetry(ctx context.Context, event *domain.Event, batchChan chan<- *domain.Event, deadLetterChan chan<- *domain.Event) {
+func (e *EnricherWorker) enrichWithRetry(ctx context.Context, event *domain.Event) {
 
-	err := e.enrich(ctx, event, batchChan)
+	err := e.enrich(ctx, event)
 	if err != nil {
 		slog.Debug("Enrich process error, entering retry flow",
 			slog.String("event_id", event.ID.String()),
@@ -479,10 +485,10 @@ func (e *EnricherWorker) enrichWithRetry(ctx context.Context, event *domain.Even
 					slog.Int("retry_count", event.RetryCount),
 					slog.Any("err", context.Cause(ctx)))
 				// push to dead letter to avoid message loss, probably triggered during shutdown
-				lastBreathToDLE(fmt.Sprintf(msg+", event_id: %s, retry_count: %d", event.ID.String(), event.RetryCount), event, deadLetterChan)
+				lastBreathToDLE(fmt.Sprintf(msg+", event_id: %s, retry_count: %d", event.ID.String(), event.RetryCount), event, e.deadLetterChan)
 				return
 			case <-time.After(retryDuration):
-				err := e.enrich(ctx, event, batchChan)
+				err := e.enrich(ctx, event)
 				if err == nil {
 					return
 				}
@@ -500,12 +506,12 @@ func (e *EnricherWorker) enrichWithRetry(ctx context.Context, event *domain.Even
 			slog.Any("err", err),
 		)
 		event.ErrorReason = err.Error()
-		sendToDLE(ctx, event, "enricher_worker", deadLetterChan)
+		sendToDLE(ctx, event, "enricher_worker", e.deadLetterChan)
 	}
 
 }
 
-func (e *EnricherWorker) enrich(ctx context.Context, event *domain.Event, batchChan chan<- *domain.Event) error {
+func (e *EnricherWorker) enrich(ctx context.Context, event *domain.Event) error {
 	start := time.Now()
 
 	// intentionally use different context for each api call
@@ -535,7 +541,7 @@ func (e *EnricherWorker) enrich(ctx context.Context, event *domain.Event, batchC
 			slog.Any("err", context.Cause(ctx)),
 		)
 		return context.Cause(ctx)
-	case batchChan <- event:
+	case e.batchChan <- event:
 		slog.Debug("EnricherWorker finish enriching data",
 			slog.Int("id", e.id),
 			slog.String("event_id", event.ID.String()),
