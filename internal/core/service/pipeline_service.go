@@ -39,7 +39,7 @@ type PipelineService struct {
 
 func NewPipelineService(ctx context.Context, txManager port.TxManager, de port.DataEnricher, cfg *config.Config) *PipelineService {
 	// initiating pipeline service
-	s := &PipelineService{
+	return &PipelineService{
 		mainCtx:          ctx,
 		txManager:        txManager,
 		dataEnricher:     de,
@@ -51,35 +51,39 @@ func NewPipelineService(ctx context.Context, txManager port.TxManager, de port.D
 		batchChan:        make(chan *domain.Event, cfg.InsertBatchSize),
 		deadLetterChan:   make(chan *domain.Event, cfg.InsertBatchSize),
 	}
+}
+
+func (p *PipelineService) Open(ctx context.Context) {
 	// initiating workers during service initiation
-	for i := range cfg.EnricherWorkerSize {
+	for i := range p.enrichWorkerSize {
 		workerCtx, workerCancelFunc := context.WithCancelCause(ctx)
 		w := &EnricherWorker{
 			id:             i + 1,
 			jobChan:        make(chan *domain.Event),
-			dataEnricher:   s.dataEnricher,
+			dataEnricher:   p.dataEnricher,
 			cancelFunc:     workerCancelFunc,
-			batchChan:      s.batchChan,
-			workerPool:     s.workerPoolChan,
-			deadLetterChan: s.deadLetterChan,
+			batchChan:      p.batchChan,
+			workerPool:     p.workerPoolChan,
+			deadLetterChan: p.deadLetterChan,
 		}
-		s.enrichWorkerList = append(s.enrichWorkerList, w)
-		s.wgWorker.Add(1)
-		go w.DataEnricherProcess(workerCtx, &s.wgWorker)
+		p.enrichWorkerList = append(p.enrichWorkerList, w)
+		p.wgWorker.Add(1)
+		go w.DataEnricherProcess(workerCtx, &p.wgWorker)
 	}
 
 	// initiating job distributor
-	s.wgJobDistributor.Add(1)
-	go s.jobDistributor(ctx, &s.wgJobDistributor)
+	p.wgJobDistributor.Add(1)
+	go p.jobDistributor(ctx, &p.wgJobDistributor)
 
 	// initiating batch process for events
-	s.wgBatchEvents.Add(1)
-	go s.batchInsert(ctx, &s.wgBatchEvents, "events", s.batchChan, s.insertEvents)
+	p.wgBatchEvents.Add(1)
+	go p.batchInsert(ctx, &p.wgBatchEvents, "events", p.batchChan, p.insertEvents)
 
 	// initiating batch process for dead-letter-events
-	s.wgBatchDLE.Add(1)
-	go s.batchInsert(ctx, &s.wgBatchDLE, "dead-letter-events", s.deadLetterChan, s.insertDeadLetterEvents)
-	return s
+	p.wgBatchDLE.Add(1)
+	go p.batchInsert(ctx, &p.wgBatchDLE, "dead-letter-events", p.deadLetterChan, p.insertDeadLetterEvents)
+
+	slog.Info("Pipeline openned, ready to ingest events")
 }
 
 func (p *PipelineService) ProcessAndStore(ctx context.Context, e *domain.Event) (int64, error) {
