@@ -17,39 +17,41 @@ import (
 type insertAction func(context.Context, []domain.Event, string) (int64, error)
 
 type PipelineService struct {
-	mainCtx          context.Context
-	txManager        port.TxManager
-	dataEnricher     port.DataEnricher
-	enrichWorkerSize int
-	enrichWorkerList []*EnricherWorker
-	workerPoolChan   chan *EnricherWorker
-	pipelineJobChan  chan *domain.Event
-	batchChan        chan *domain.Event
-	deadLetterChan   chan *domain.Event
-	wgWorker         sync.WaitGroup
-	wgBatchEvents    sync.WaitGroup
-	wgBatchDLE       sync.WaitGroup
-	wgStoreRetry     sync.WaitGroup
-	wgJobDistributor sync.WaitGroup
-	insertBatchSize  int
-	rejectedCount    atomic.Int64
-	successCount     atomic.Int64
-	deadLetterCount  atomic.Int64
+	mainCtx           context.Context
+	txManager         port.TxManager
+	dataEnricher      port.DataEnricher
+	enrichWorkerSize  int
+	enrichWorkerList  []*EnricherWorker
+	workerPoolChan    chan *EnricherWorker
+	pipelineJobChan   chan *domain.Event
+	batchChan         chan *domain.Event
+	deadLetterChan    chan *domain.Event
+	wgWorker          sync.WaitGroup
+	wgBatchEvents     sync.WaitGroup
+	wgBatchDLE        sync.WaitGroup
+	wgStoreRetry      sync.WaitGroup
+	wgJobDistributor  sync.WaitGroup
+	insertBatchSize   int
+	rejectedCount     atomic.Int64
+	successCount      atomic.Int64
+	deadLetterCount   atomic.Int64
+	backoffMulitplier time.Duration
 }
 
 func NewPipelineService(ctx context.Context, txManager port.TxManager, de port.DataEnricher, cfg *config.Config) *PipelineService {
 	// initiating pipeline service
 	return &PipelineService{
-		mainCtx:          ctx,
-		txManager:        txManager,
-		dataEnricher:     de,
-		workerPoolChan:   make(chan *EnricherWorker, cfg.EnricherWorkerSize),
-		pipelineJobChan:  make(chan *domain.Event, cfg.PipelineJobSize),
-		insertBatchSize:  cfg.InsertBatchSize,
-		enrichWorkerSize: cfg.EnricherWorkerSize,
-		enrichWorkerList: []*EnricherWorker{},
-		batchChan:        make(chan *domain.Event, cfg.InsertBatchSize),
-		deadLetterChan:   make(chan *domain.Event, cfg.InsertBatchSize),
+		mainCtx:           ctx,
+		txManager:         txManager,
+		dataEnricher:      de,
+		workerPoolChan:    make(chan *EnricherWorker, cfg.EnricherWorkerSize),
+		pipelineJobChan:   make(chan *domain.Event, cfg.PipelineJobSize),
+		insertBatchSize:   cfg.InsertBatchSize,
+		enrichWorkerSize:  cfg.EnricherWorkerSize,
+		enrichWorkerList:  []*EnricherWorker{},
+		batchChan:         make(chan *domain.Event, cfg.InsertBatchSize),
+		deadLetterChan:    make(chan *domain.Event, cfg.InsertBatchSize),
+		backoffMulitplier: cfg.BackoffMulitplier,
 	}
 }
 
@@ -128,7 +130,7 @@ func (p *PipelineService) storeWithRetry(ctx context.Context, e *domain.Event, w
 
 		// retry flow
 		e.RetryCount++
-		retryDuration := time.Duration(e.RetryCount*2) * time.Second
+		retryDuration := time.Duration(e.RetryCount*2) * p.backoffMulitplier
 		select {
 		case <-time.After(retryDuration):
 			slog.Debug("Failed to store data into the pipeline",
@@ -426,7 +428,7 @@ func (e *EnricherWorker) DataEnricherProcess(ctx context.Context, wg *sync.WaitG
 				return
 			}
 			inPool = false
-			e.enriceWithPanihcHandling(ctx, event)
+			e.enriceWithPanicHandling(ctx, event)
 			ticker.Reset(tickerDuration)
 
 			// drain the ticker, remove any stale tick while the worker busy previously
@@ -448,7 +450,7 @@ func (e *EnricherWorker) DataEnricherProcess(ctx context.Context, wg *sync.WaitG
 	}
 }
 
-func (e *EnricherWorker) enriceWithPanihcHandling(ctx context.Context, event *domain.Event) {
+func (e *EnricherWorker) enriceWithPanicHandling(ctx context.Context, event *domain.Event) {
 
 	// handle panic here
 	defer func() {

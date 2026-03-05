@@ -6,6 +6,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/joho/godotenv"
 )
@@ -26,6 +27,7 @@ type Config struct {
 	EnricherWorkerSize int
 	InsertBatchSize    int
 	PipelineJobSize    int
+	BackoffMulitplier  time.Duration
 }
 
 func Load() (*Config, error) {
@@ -53,6 +55,7 @@ func Load() (*Config, error) {
 		EnricherWorkerSize: getEnvInt("ENRICHER_WORKER_SIZE", 2),
 		InsertBatchSize:    getEnvInt("INSERT_BATCH_SIZE", 5),
 		PipelineJobSize:    getEnvInt("PIPELINE_JOB_SIZE", 50),
+		BackoffMulitplier:  parseTimeDurationUnit(getEnv("BACKOFF_MULTIPLIER", "SECOND")),
 	}, nil
 }
 
@@ -74,4 +77,15 @@ func getEnvInt(key string, fallback int) int {
 		return fallback
 	}
 	return v
+}
+
+func parseTimeDurationUnit(unit string) time.Duration {
+	switch strings.ToUpper(unit) {
+	case "SECOND":
+		return time.Second
+	case "MINUTE":
+		return time.Minute
+	default:
+		return time.Millisecond
+	}
 }
