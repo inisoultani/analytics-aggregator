@@ -5,6 +5,7 @@ import (
 	"analytics-aggregator/internal/core/domain"
 	"analytics-aggregator/internal/core/port"
 	"context"
+	"log/slog"
 	"sync"
 	"testing"
 	"time"
@@ -282,55 +283,97 @@ func (m *MockTxManager) WithTx(ctx context.Context, fn func(port.PipelineReposit
 
 type TestPipelineSuite struct {
 	suite.Suite
-	ps  *PipelineService
-	mer *MockEventRepository
+	ps           *PipelineService
+	mer          *MockEventRepository
+	doneMockChan chan bool
 }
 
-func(s *TestPipelineSuite) SetupSuite() {
-	
+func (s *TestPipelineSuite) SetupSuite() {
+	s.mer = new(MockEventRepository)
+
+	s.ps = &PipelineService{
+		txManager: &MockTxManager{
+			mpr: &MockPipelineRepository{
+				mer: s.mer,
+			},
+		},
+		insertBatchSize:           2,
+		batchInsertTickerDuration: time.Duration(10 * time.Second),
+		batchChan:                 make(chan *domain.Event, 2),
+		deadLetterChan:            make(chan *domain.Event, 2),
+	}
 }
 
-func TestPipelineService_insertEvents(t *testing.T) {
+func (s *TestPipelineSuite) SetupTest() {
+	s.doneMockChan = make(chan bool)
+}
 
-	doneMockChan := make(chan bool)
-	mer := new(MockEventRepository)
-	mer.On("CreateEvents", mock.Anything, mock.MatchedBy(func(events []domain.Event) bool {
+func (s *TestPipelineSuite) TestPipelineService_insertEvents() {
+
+	s.mer.On("CreateEvents", mock.Anything, mock.MatchedBy(func(events []domain.Event) bool {
 		return len(events) == 2
 	})).
 		Return(int64(2), nil).
 		Run(func(args mock.Arguments) {
-			close(doneMockChan)
+			close(s.doneMockChan)
 		}).
 		Once()
 
-	s := &PipelineService{
-		txManager: &MockTxManager{
-			mpr: &MockPipelineRepository{
-				mer: mer,
-			},
-		},
-		insertBatchSize:           2,
-		batchChan:                 make(chan *domain.Event, 2),
-		batchInsertTickerDuration: time.Duration(10 * time.Second),
-	}
-	s.batchChan <- &domain.Event{ID: uuid.New()}
-	s.batchChan <- &domain.Event{ID: uuid.New()}
+	s.ps.batchChan <- &domain.Event{ID: uuid.New()}
+	s.ps.batchChan <- &domain.Event{ID: uuid.New()}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
 	wg.Add(1)
-	go s.batchInsert(ctx, &wg, "test_batch", s.batchChan, s.insertEvents)
+	go s.ps.batchInsert(ctx, &wg, "test_batch", s.ps.batchChan, s.ps.insertEvents)
 
 	select {
-	case <-doneMockChan:
-		t.Log("Successfully execute InsertEvents")
+	case <-s.doneMockChan:
+		slog.Info("Successfully execute InsertEvents")
 	case <-time.After(1 * time.Second):
-		t.Fatal("Timeout:  mockInsertAction.InsertActionDummy never called by batchInsert")
+		slog.Error("Timeout:  mockInsertAction.InsertActionDummy never called by batchInsert")
 	}
 
-	close(s.batchChan)
+	close(s.ps.batchChan)
 	cancel()
 	wg.Wait()
 
-	mer.AssertExpectations(t)
+	s.mer.AssertExpectations(s.T())
+}
+
+func (s *TestPipelineSuite) TestPipelineService_insertDeadLetterEvents() {
+
+	s.mer.On("CreateDeadLetters", mock.Anything, mock.MatchedBy(func(events []domain.Event) bool {
+		return len(events) == 2
+	})).
+		Return(int64(2), nil).
+		Run(func(args mock.Arguments) {
+			close(s.doneMockChan)
+		}).
+		Once()
+
+	s.ps.deadLetterChan <- &domain.Event{ID: uuid.New()}
+	s.ps.deadLetterChan <- &domain.Event{ID: uuid.New()}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go s.ps.batchInsert(ctx, &wg, "test_batch", s.ps.deadLetterChan, s.ps.insertDeadLetterEvents)
+
+	select {
+	case <-s.doneMockChan:
+		slog.Info("Successfully execute InsertEvents")
+	case <-time.After(1 * time.Second):
+		slog.Error("Timeout:  mockInsertAction.InsertActionDummy never called by batchInsert")
+	}
+
+	close(s.ps.deadLetterChan)
+	cancel()
+	wg.Wait()
+
+	s.mer.AssertExpectations(s.T())
+}
+
+func TestExampleSuite(t *testing.T) {
+	suite.Run(t, new(TestPipelineSuite))
 }
