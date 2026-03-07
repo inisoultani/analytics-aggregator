@@ -3,6 +3,7 @@ package service
 import (
 	"analytics-aggregator/internal/config"
 	"analytics-aggregator/internal/core/domain"
+	"analytics-aggregator/internal/core/port"
 	"context"
 	"sync"
 	"testing"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/suite"
 )
 
 type MockEnricher struct{}
@@ -153,11 +155,11 @@ func TestPipelineService_AssignWorker_AssignEvent(t *testing.T) {
 
 }
 
-type MockInsertDatabase struct {
+type MockInsertAction struct {
 	mock.Mock
 }
 
-func (mid *MockInsertDatabase) InsertActionDummy(ctx context.Context, events []domain.Event, batchName string) (int64, error) {
+func (mid *MockInsertAction) InsertFn(ctx context.Context, events []domain.Event, batchName string) (int64, error) {
 	args := mid.Called(ctx, events, batchName)
 	return args.Get(0).(int64), args.Error(1)
 }
@@ -170,10 +172,10 @@ func TestPipelineService_batchInsert_batchSize(t *testing.T) {
 		batchInsertTickerDuration: time.Duration(3 * time.Second),
 	}
 
-	mockInsertAction := new(MockInsertDatabase)
+	mockInsertAction := new(MockInsertAction)
 	doneMockChan := make(chan bool)
 
-	mockInsertAction.On("InsertActionDummy", mock.Anything, mock.MatchedBy(func(events []domain.Event) bool {
+	mockInsertAction.On("InsertFn", mock.Anything, mock.MatchedBy(func(events []domain.Event) bool {
 		return len(events) == 2
 	}), "test_batch").
 		Return(int64(2), nil).
@@ -188,7 +190,7 @@ func TestPipelineService_batchInsert_batchSize(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
 	wg.Add(1)
-	go s.batchInsert(ctx, &wg, "test_batch", s.batchChan, mockInsertAction.InsertActionDummy)
+	go s.batchInsert(ctx, &wg, "test_batch", s.batchChan, mockInsertAction.InsertFn)
 
 	select {
 	case <-doneMockChan:
@@ -211,10 +213,10 @@ func TestPipelineService_batchInsert_ticker(t *testing.T) {
 		batchInsertTickerDuration: time.Duration(10 * time.Millisecond),
 	}
 
-	mockInsertAction := new(MockInsertDatabase)
+	mockInsertAction := new(MockInsertAction)
 	doneMockChan := make(chan bool)
 
-	mockInsertAction.On("InsertActionDummy", mock.Anything, mock.MatchedBy(func(events []domain.Event) bool {
+	mockInsertAction.On("InsertFn", mock.Anything, mock.MatchedBy(func(events []domain.Event) bool {
 		return len(events) == 2
 	}), "test_batch").
 		Return(int64(2), nil).
@@ -229,7 +231,7 @@ func TestPipelineService_batchInsert_ticker(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
 	wg.Add(1)
-	go s.batchInsert(ctx, &wg, "test_batch", s.batchChan, mockInsertAction.InsertActionDummy)
+	go s.batchInsert(ctx, &wg, "test_batch", s.batchChan, mockInsertAction.InsertFn)
 
 	select {
 	case <-doneMockChan:
@@ -242,4 +244,93 @@ func TestPipelineService_batchInsert_ticker(t *testing.T) {
 	wg.Wait()
 
 	mockInsertAction.AssertExpectations(t)
+}
+
+type MockPipelineRepository struct {
+	mer *MockEventRepository
+}
+
+func (m *MockPipelineRepository) Event() port.EventRepository {
+	return m.mer
+}
+
+func (m *MockPipelineRepository) DeadLetterEvent() port.DeadLetterEventRepository {
+	return m.mer
+}
+
+type MockEventRepository struct {
+	mock.Mock
+}
+
+func (m *MockEventRepository) CreateEvents(ctx context.Context, e []domain.Event) (int64, error) {
+	args := m.Called(ctx, e)
+	return args.Get(0).(int64), args.Error(1)
+}
+
+func (m *MockEventRepository) CreateDeadLetters(ctx context.Context, e []domain.Event) (int64, error) {
+	args := m.Called(ctx, e)
+	return args.Get(0).(int64), args.Error(1)
+}
+
+type MockTxManager struct {
+	mpr *MockPipelineRepository
+}
+
+func (m *MockTxManager) WithTx(ctx context.Context, fn func(port.PipelineRepository) error) error {
+	return fn(m.mpr)
+}
+
+type TestPipelineSuite struct {
+	suite.Suite
+	ps  *PipelineService
+	mer *MockEventRepository
+}
+
+func(s *TestPipelineSuite) SetupSuite() {
+	
+}
+
+func TestPipelineService_insertEvents(t *testing.T) {
+
+	doneMockChan := make(chan bool)
+	mer := new(MockEventRepository)
+	mer.On("CreateEvents", mock.Anything, mock.MatchedBy(func(events []domain.Event) bool {
+		return len(events) == 2
+	})).
+		Return(int64(2), nil).
+		Run(func(args mock.Arguments) {
+			close(doneMockChan)
+		}).
+		Once()
+
+	s := &PipelineService{
+		txManager: &MockTxManager{
+			mpr: &MockPipelineRepository{
+				mer: mer,
+			},
+		},
+		insertBatchSize:           2,
+		batchChan:                 make(chan *domain.Event, 2),
+		batchInsertTickerDuration: time.Duration(10 * time.Second),
+	}
+	s.batchChan <- &domain.Event{ID: uuid.New()}
+	s.batchChan <- &domain.Event{ID: uuid.New()}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go s.batchInsert(ctx, &wg, "test_batch", s.batchChan, s.insertEvents)
+
+	select {
+	case <-doneMockChan:
+		t.Log("Successfully execute InsertEvents")
+	case <-time.After(1 * time.Second):
+		t.Fatal("Timeout:  mockInsertAction.InsertActionDummy never called by batchInsert")
+	}
+
+	close(s.batchChan)
+	cancel()
+	wg.Wait()
+
+	mer.AssertExpectations(t)
 }
