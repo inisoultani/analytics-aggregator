@@ -158,7 +158,6 @@ func (p *PipelineService) jobDistributor(ctx context.Context, wg *sync.WaitGroup
 
 	slog.Info("Initiating job distributor...")
 
-	// time.Sleep(10 * time.Second)
 	for {
 		select {
 		case e, ok := <-p.pipelineJobChan:

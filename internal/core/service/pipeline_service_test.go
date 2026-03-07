@@ -80,3 +80,41 @@ func TestPipelineService_StoreWithRetry_BackpressureMaxRetries(t *testing.T) {
 	wg.Wait()
 
 }
+
+func TestPipelineService_JobDistributor_RoutesEvent(t *testing.T) {
+
+	s := &PipelineService{
+		pipelineJobChan: make(chan *domain.Event, 1),
+		workerPoolChan:  make(chan *EnricherWorker, 1),
+	}
+	event := &domain.Event{
+		ID: uuid.New(),
+	}
+	s.pipelineJobChan <- event
+
+	dummyWorkerId := 123
+	dummyWorker := &EnricherWorker{
+		id:      dummyWorkerId,
+		jobChan: make(chan *domain.Event, 1),
+	}
+	s.workerPoolChan <- dummyWorker
+
+	ctxCancel, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go s.jobDistributor(ctxCancel, &wg)
+
+	select {
+	case e := <-dummyWorker.jobChan:
+		if e.ID != event.ID {
+			t.Errorf("Expected event ID : %s, found something else", e.ID.String())
+		}
+		t.Logf("Successfully receive event ID : %s", e.ID)
+	case <-time.After(1 * time.Second):
+		t.Errorf("Timeout during waiting for event")
+	}
+
+	cancel()
+	wg.Wait()
+
+}

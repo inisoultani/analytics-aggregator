@@ -27,24 +27,24 @@ type PostgresTxManager struct {
 
 func (p *PostgresTxManager) WithTx(ctx context.Context, fn func(port.PipelineRepository) error) error {
 	return db.WithTx(ctx, p.pool, func(tx pgx.Tx) error {
-		txRepo := &PostgresAnalyticsAggregatorRepository{
+		txRepo := &PostgresRepository{
 			queries: p.queries.WithTx(tx),
 		}
 		return fn(txRepo)
 	})
 }
 
-type PostgresAnalyticsAggregatorRepository struct {
+type PostgresRepository struct {
 	queries *sqlc.Queries
 }
 
-func (p *PostgresAnalyticsAggregatorRepository) Event() port.EventRepository {
+func (p *PostgresRepository) Event() port.EventRepository {
 	return &PostgresEventRepository{
 		queries: p.queries,
 	}
 }
 
-func (p *PostgresAnalyticsAggregatorRepository) DeadLetterEvent() port.DeadLetterEventRepository {
+func (p *PostgresRepository) DeadLetterEvent() port.DeadLetterEventRepository {
 	return &PostgresDeadLetterEventRepository{
 		queries: p.queries,
 	}
