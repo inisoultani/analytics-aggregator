@@ -118,3 +118,36 @@ func TestPipelineService_JobDistributor_RoutesEvent(t *testing.T) {
 	wg.Wait()
 
 }
+
+func TestPipelineService_AssignWorker_AssignEvent(t *testing.T) {
+	s := &PipelineService{
+		pipelineJobChan: make(chan *domain.Event, 1),
+		workerPoolChan:  make(chan *EnricherWorker, 1),
+		deadLetterChan:  make(chan *domain.Event, 1),
+	}
+	event := &domain.Event{
+		ID: uuid.New(),
+	}
+
+	dummyWorkerId := 123
+	dummyWorker := &EnricherWorker{
+		id:      dummyWorkerId,
+		jobChan: make(chan *domain.Event, 1),
+	}
+	s.workerPoolChan <- dummyWorker
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s.assignWorker(ctx, event)
+
+	select {
+	case e := <-dummyWorker.jobChan:
+		if e.ID != event.ID {
+			t.Errorf("Expected to receive event id : %s, but receive something else", event.ID.String())
+		}
+		t.Logf("Successfully assignWorker with event id : %s", e.ID.String())
+	case <-time.After(1 * time.Second):
+		t.Errorf("Timeout ")
+	}
+
+}

@@ -177,13 +177,11 @@ func (p *PipelineService) jobDistributor(ctx context.Context, wg *sync.WaitGroup
 }
 
 func (p *PipelineService) assignWorker(ctx context.Context, e *domain.Event) {
-	// defer wg.Done()
 
-	// time.Sleep(1 * time.Second)
 	slog.Debug("assignWorker processing event",
 		slog.String("event_id", e.ID.String()),
 	)
-	// ew := <-p.workerPoolChan
+
 	var worker *EnricherWorker
 	select {
 	case ew := <-p.workerPoolChan:
@@ -198,7 +196,6 @@ func (p *PipelineService) assignWorker(ctx context.Context, e *domain.Event) {
 		return
 	}
 
-	// ew.jobChan <- e
 	select {
 	case worker.jobChan <- e:
 		// job succesfully handed to worker channel
