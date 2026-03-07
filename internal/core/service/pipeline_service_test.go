@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/stretchr/testify/mock"
 )
 
 type MockEnricher struct{}
@@ -150,4 +151,95 @@ func TestPipelineService_AssignWorker_AssignEvent(t *testing.T) {
 		t.Errorf("Timeout ")
 	}
 
+}
+
+type MockInsertDatabase struct {
+	mock.Mock
+}
+
+func (mid *MockInsertDatabase) InsertActionDummy(ctx context.Context, events []domain.Event, batchName string) (int64, error) {
+	args := mid.Called(ctx, events, batchName)
+	return args.Get(0).(int64), args.Error(1)
+}
+
+func TestPipelineService_batchInsert_batchSize(t *testing.T) {
+
+	s := &PipelineService{
+		insertBatchSize:           2,
+		batchChan:                 make(chan *domain.Event, 2),
+		batchInsertTickerDuration: time.Duration(3 * time.Second),
+	}
+
+	mockInsertAction := new(MockInsertDatabase)
+	doneMockChan := make(chan bool)
+
+	mockInsertAction.On("InsertActionDummy", mock.Anything, mock.MatchedBy(func(events []domain.Event) bool {
+		return len(events) == 2
+	}), "test_batch").
+		Return(int64(2), nil).
+		Run(func(args mock.Arguments) {
+			close(doneMockChan)
+		}).
+		Once()
+
+	s.batchChan <- &domain.Event{ID: uuid.New()}
+	s.batchChan <- &domain.Event{ID: uuid.New()}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go s.batchInsert(ctx, &wg, "test_batch", s.batchChan, mockInsertAction.InsertActionDummy)
+
+	select {
+	case <-doneMockChan:
+		t.Log("Successfully capture the database insert process")
+	case <-time.After(1 * time.Second):
+		t.Fatal("Timeout:  mockInsertAction.InsertActionDummy never called by batchInsert")
+	}
+
+	cancel()
+	wg.Wait()
+
+	mockInsertAction.AssertExpectations(t)
+}
+
+func TestPipelineService_batchInsert_ticker(t *testing.T) {
+
+	s := &PipelineService{
+		insertBatchSize:           5,
+		batchChan:                 make(chan *domain.Event, 2),
+		batchInsertTickerDuration: time.Duration(10 * time.Millisecond),
+	}
+
+	mockInsertAction := new(MockInsertDatabase)
+	doneMockChan := make(chan bool)
+
+	mockInsertAction.On("InsertActionDummy", mock.Anything, mock.MatchedBy(func(events []domain.Event) bool {
+		return len(events) == 2
+	}), "test_batch").
+		Return(int64(2), nil).
+		Run(func(args mock.Arguments) {
+			close(doneMockChan)
+		}).
+		Once()
+
+	s.batchChan <- &domain.Event{ID: uuid.New()}
+	s.batchChan <- &domain.Event{ID: uuid.New()}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go s.batchInsert(ctx, &wg, "test_batch", s.batchChan, mockInsertAction.InsertActionDummy)
+
+	select {
+	case <-doneMockChan:
+		t.Log("Successfully capture the database insert process")
+	case <-time.After(1 * time.Second):
+		t.Fatal("Timeout:  mockInsertAction.InsertActionDummy never called by batchInsert")
+	}
+
+	cancel()
+	wg.Wait()
+
+	mockInsertAction.AssertExpectations(t)
 }

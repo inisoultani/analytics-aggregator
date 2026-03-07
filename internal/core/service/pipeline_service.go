@@ -17,41 +17,43 @@ import (
 type insertAction func(context.Context, []domain.Event, string) (int64, error)
 
 type PipelineService struct {
-	mainCtx           context.Context
-	txManager         port.TxManager
-	dataEnricher      port.DataEnricher
-	enrichWorkerSize  int
-	enrichWorkerList  []*EnricherWorker
-	workerPoolChan    chan *EnricherWorker
-	pipelineJobChan   chan *domain.Event
-	batchChan         chan *domain.Event
-	deadLetterChan    chan *domain.Event
-	wgWorker          sync.WaitGroup
-	wgBatchEvents     sync.WaitGroup
-	wgBatchDLE        sync.WaitGroup
-	wgStoreRetry      sync.WaitGroup
-	wgJobDistributor  sync.WaitGroup
-	insertBatchSize   int
-	rejectedCount     atomic.Int64
-	successCount      atomic.Int64
-	deadLetterCount   atomic.Int64
-	backoffMulitplier time.Duration
+	mainCtx                   context.Context
+	txManager                 port.TxManager
+	dataEnricher              port.DataEnricher
+	enrichWorkerSize          int
+	enrichWorkerList          []*EnricherWorker
+	workerPoolChan            chan *EnricherWorker
+	pipelineJobChan           chan *domain.Event
+	batchChan                 chan *domain.Event
+	deadLetterChan            chan *domain.Event
+	wgWorker                  sync.WaitGroup
+	wgBatchEvents             sync.WaitGroup
+	wgBatchDLE                sync.WaitGroup
+	wgStoreRetry              sync.WaitGroup
+	wgJobDistributor          sync.WaitGroup
+	insertBatchSize           int
+	rejectedCount             atomic.Int64
+	successCount              atomic.Int64
+	deadLetterCount           atomic.Int64
+	backoffMulitplier         time.Duration
+	batchInsertTickerDuration time.Duration
 }
 
 func NewPipelineService(ctx context.Context, txManager port.TxManager, de port.DataEnricher, cfg *config.Config) *PipelineService {
 	// initiating pipeline service
 	return &PipelineService{
-		mainCtx:           ctx,
-		txManager:         txManager,
-		dataEnricher:      de,
-		workerPoolChan:    make(chan *EnricherWorker, cfg.EnricherWorkerSize),
-		pipelineJobChan:   make(chan *domain.Event, cfg.PipelineJobSize),
-		insertBatchSize:   cfg.InsertBatchSize,
-		enrichWorkerSize:  cfg.EnricherWorkerSize,
-		enrichWorkerList:  []*EnricherWorker{},
-		batchChan:         make(chan *domain.Event, cfg.InsertBatchSize),
-		deadLetterChan:    make(chan *domain.Event, cfg.InsertBatchSize),
-		backoffMulitplier: cfg.BackoffMulitplier,
+		mainCtx:                   ctx,
+		txManager:                 txManager,
+		dataEnricher:              de,
+		workerPoolChan:            make(chan *EnricherWorker, cfg.EnricherWorkerSize),
+		pipelineJobChan:           make(chan *domain.Event, cfg.PipelineJobSize),
+		insertBatchSize:           cfg.InsertBatchSize,
+		enrichWorkerSize:          cfg.EnricherWorkerSize,
+		enrichWorkerList:          []*EnricherWorker{},
+		batchChan:                 make(chan *domain.Event, cfg.InsertBatchSize),
+		deadLetterChan:            make(chan *domain.Event, cfg.InsertBatchSize),
+		backoffMulitplier:         cfg.BackoffMulitplier,
+		batchInsertTickerDuration: time.Duration(3000 * time.Millisecond),
 	}
 }
 
@@ -212,7 +214,7 @@ func (p *PipelineService) assignWorker(ctx context.Context, e *domain.Event) {
 func (p *PipelineService) batchInsert(ctx context.Context, wg *sync.WaitGroup, batchName string, c <-chan *domain.Event, insertAction insertAction) {
 	defer wg.Done()
 
-	duration := time.Duration(3000 * time.Millisecond)
+	duration := p.batchInsertTickerDuration
 	ticker := time.NewTicker(duration)
 	defer ticker.Stop()
 	slog.Info("Initiating batchInsert with ticker...",
