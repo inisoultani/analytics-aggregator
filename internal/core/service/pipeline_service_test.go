@@ -11,28 +11,78 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/suite"
 )
 
-type MockEnricher struct{}
+type MockEnricher struct {
+	mock.Mock
+}
 
 func (m *MockEnricher) EnrichIp(ctx context.Context, ip string) ([]byte, error) {
-	panic("intended issue during api call - unit test")
+	// panic("intended issue during api call - unit test")
+	args := m.Called(ctx, ip)
+	return args.Get(0).([]byte), args.Error(1)
+}
+
+func TestWorker_DataEnricherProcess_NormalFlow(t *testing.T) {
+	me := new(MockEnricher)
+	me.On("EnrichIp", mock.Anything, "1.2.3.4").
+		Return([]byte(`{"test":"ok"}`), nil).
+		Once()
+
+	dlc := make(chan *domain.Event, 1)
+	batchChan := make(chan *domain.Event, 1)
+	worker := &EnricherWorker{
+		id:                           1,
+		dataEnricher:                 me,
+		jobChan:                      make(chan *domain.Event, 1),
+		deadLetterChan:               dlc,
+		batchChan:                    batchChan,
+		workerPool:                   make(chan *EnricherWorker, 1),
+		enricherWorkerTickerDuration: time.Duration(1 * time.Second),
+	}
+
+	eventId := uuid.New()
+	worker.jobChan <- &domain.Event{ID: eventId, ClientIP: "1.2.3.4"}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	ctx, cancel := context.WithCancel(context.Background())
+	go worker.DataEnricherProcess(ctx, &wg)
+
+	select {
+	case event := <-batchChan:
+		assert.Equal(t, eventId, event.ID)
+	case <-time.After(1 * time.Second):
+		t.Fatal("Time out during waiting for panic event in batch channel")
+	}
+
+	cancel()
+	close(worker.jobChan)
+	close(worker.workerPool)
+	wg.Wait()
+
+	me.AssertExpectations(t)
+
 }
 
 func TestWorker_ExecuteSafely_RecoverFromPanic(t *testing.T) {
+
+	me := new(MockEnricher)
+	me.On("EnrichIp", mock.Anything, "1.2.3.4").
+		Panic("intended issue during api call - unit test").
+		Once()
+
 	dlc := make(chan *domain.Event, 1)
 	worker := &EnricherWorker{
 		id:             1,
-		dataEnricher:   &MockEnricher{},
+		dataEnricher:   me,
 		deadLetterChan: dlc,
 	}
 
-	e := &domain.Event{
-		ID: uuid.New(),
-	}
-
+	e := &domain.Event{ID: uuid.New(), ClientIP: "1.2.3.4"}
 	worker.enriceWithPanicHandling(context.Background(), e)
 
 	select {

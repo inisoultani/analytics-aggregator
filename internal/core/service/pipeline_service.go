@@ -37,6 +37,7 @@ type PipelineService struct {
 	deadLetterCount           atomic.Int64
 	backoffMulitplier         time.Duration
 	batchInsertTickerDuration time.Duration
+	enricherWorkerDuration    time.Duration
 }
 
 func NewPipelineService(ctx context.Context, txManager port.TxManager, de port.DataEnricher, cfg *config.Config) *PipelineService {
@@ -53,7 +54,8 @@ func NewPipelineService(ctx context.Context, txManager port.TxManager, de port.D
 		batchChan:                 make(chan *domain.Event, cfg.InsertBatchSize),
 		deadLetterChan:            make(chan *domain.Event, cfg.InsertBatchSize),
 		backoffMulitplier:         cfg.BackoffMulitplier,
-		batchInsertTickerDuration: time.Duration(3000 * time.Millisecond),
+		batchInsertTickerDuration: time.Duration(3 * time.Second),
+		enricherWorkerDuration:    time.Duration(5 * time.Second),
 	}
 }
 
@@ -62,13 +64,14 @@ func (p *PipelineService) Open(ctx context.Context) {
 	for i := range p.enrichWorkerSize {
 		workerCtx, workerCancelFunc := context.WithCancelCause(ctx)
 		w := &EnricherWorker{
-			id:             i + 1,
-			jobChan:        make(chan *domain.Event),
-			dataEnricher:   p.dataEnricher,
-			cancelFunc:     workerCancelFunc,
-			batchChan:      p.batchChan,
-			workerPool:     p.workerPoolChan,
-			deadLetterChan: p.deadLetterChan,
+			id:                           i + 1,
+			jobChan:                      make(chan *domain.Event),
+			dataEnricher:                 p.dataEnricher,
+			cancelFunc:                   workerCancelFunc,
+			batchChan:                    p.batchChan,
+			workerPool:                   p.workerPoolChan,
+			deadLetterChan:               p.deadLetterChan,
+			enricherWorkerTickerDuration: p.enricherWorkerDuration,
 		}
 		p.enrichWorkerList = append(p.enrichWorkerList, w)
 		p.wgWorker.Add(1)
@@ -383,13 +386,14 @@ func (p *PipelineService) Close() {
 }
 
 type EnricherWorker struct {
-	id             int
-	jobChan        chan *domain.Event
-	dataEnricher   port.DataEnricher
-	cancelFunc     context.CancelCauseFunc
-	batchChan      chan<- *domain.Event
-	workerPool     chan<- *EnricherWorker
-	deadLetterChan chan<- *domain.Event
+	id                           int
+	jobChan                      chan *domain.Event
+	dataEnricher                 port.DataEnricher
+	cancelFunc                   context.CancelCauseFunc
+	batchChan                    chan<- *domain.Event
+	workerPool                   chan<- *EnricherWorker
+	deadLetterChan               chan<- *domain.Event
+	enricherWorkerTickerDuration time.Duration
 }
 
 func (e *EnricherWorker) DataEnricherProcess(ctx context.Context, wg *sync.WaitGroup) {
@@ -400,7 +404,7 @@ func (e *EnricherWorker) DataEnricherProcess(ctx context.Context, wg *sync.WaitG
 	)
 
 	inPool := false
-	tickerDuration := time.Duration(5 * time.Second)
+	tickerDuration := e.enricherWorkerTickerDuration
 	ticker := time.NewTicker(tickerDuration)
 	defer ticker.Stop()
 	for {
