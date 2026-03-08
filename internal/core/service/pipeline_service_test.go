@@ -131,6 +131,36 @@ func TestPipelineService_ProcessAndStore(t *testing.T) {
 
 }
 
+func TestPipelineService_StoreWithRetry_NormalFlow(t *testing.T) {
+	cfg := &config.Config{
+		EnricherWorkerSize: 1,
+		PipelineJobSize:    1,
+		InsertBatchSize:    1,
+		// this is to ensure that the retry will not spent more 12 milliseconds instead 12 second
+		BackoffMulitplier: time.Millisecond,
+	}
+
+	dummyEvent := &domain.Event{ID: uuid.New()}
+	mainCtx, cancelMainCtx := context.WithCancel(context.Background())
+	service := NewPipelineService(mainCtx, nil, &MockEnricher{}, cfg)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go service.storeWithRetry(context.Background(), dummyEvent, &wg)
+
+	select {
+	case e := <-service.pipelineJobChan:
+		if e.ID != dummyEvent.ID {
+			t.Errorf("Expected to receive event with id : '%s', got : %s", dummyEvent.ID.String(), e.ID.String())
+		}
+		t.Logf("Successfully receive id '%s'", e.ID.String())
+	case <-time.After(1 * time.Second):
+		t.Fatal("Time out during waiting for dead letter event")
+	}
+	cancelMainCtx()
+	wg.Wait()
+}
+
 func TestPipelineService_StoreWithRetry_BackpressureMaxRetries(t *testing.T) {
 	cfg := &config.Config{
 		EnricherWorkerSize: 1,
