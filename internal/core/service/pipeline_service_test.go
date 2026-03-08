@@ -60,9 +60,9 @@ func TestWorker_DataEnricherProcess_NormalFlow(t *testing.T) {
 	}
 
 	cancel()
+	wg.Wait()
 	close(worker.jobChan)
 	close(worker.workerPool)
-	wg.Wait()
 
 	me.AssertExpectations(t)
 
@@ -94,6 +94,19 @@ func TestWorker_ExecuteSafely_RecoverFromPanic(t *testing.T) {
 	case <-time.After(1 * time.Second):
 		t.Fatal("Time out during waiting for panic event in DLC")
 	}
+}
+
+func TestPipelineService_Start_Stop(t *testing.T) {
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Errorf("Error during testing loading config : %v", err)
+	}
+
+	s := NewPipelineService(context.Background(), &MockTxManager{}, &MockEnricher{}, cfg)
+	s.Open(context.Background())
+	s.Close()
+
 }
 
 func TestPipelineService_StoreWithRetry_BackpressureMaxRetries(t *testing.T) {
