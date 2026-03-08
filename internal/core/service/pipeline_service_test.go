@@ -109,6 +109,28 @@ func TestPipelineService_Start_Stop(t *testing.T) {
 
 }
 
+func TestPipelineService_ProcessAndStore(t *testing.T) {
+	cfg := &config.Config{
+		EnricherWorkerSize: 1,
+		PipelineJobSize:    1,
+		InsertBatchSize:    1,
+		BackoffMulitplier:  time.Second,
+	}
+
+	mainCtx, cancel := context.WithCancel(context.Background())
+	service := NewPipelineService(context.Background(), nil, &MockEnricher{}, cfg)
+	service.mainCtx = mainCtx
+
+	num, err := service.ProcessAndStore(context.Background(), &domain.Event{ID: uuid.New()})
+
+	cancel()
+	service.wgStoreRetry.Wait()
+
+	assert.Equal(t, num, int64(1))
+	assert.Equal(t, err, nil)
+
+}
+
 func TestPipelineService_StoreWithRetry_BackpressureMaxRetries(t *testing.T) {
 	cfg := &config.Config{
 		EnricherWorkerSize: 1,
