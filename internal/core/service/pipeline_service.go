@@ -455,7 +455,6 @@ func (e *EnricherWorker) DataEnricherProcess(ctx context.Context, wg *sync.WaitG
 }
 
 func (e *EnricherWorker) enriceWithPanicHandling(ctx context.Context, event *domain.Event) {
-
 	// handle panic here
 	defer func() {
 		if r := recover(); r != nil {

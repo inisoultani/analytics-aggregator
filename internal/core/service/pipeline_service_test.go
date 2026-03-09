@@ -605,6 +605,42 @@ func TestWorker_DataEnricherProcess_NormalFlow(t *testing.T) {
 
 }
 
+func TestWorker_DataEnricherProcess_Sleep_And_CtxCancelled(t *testing.T) {
+	me := new(MockEnricher)
+	// me.On("EnrichIp", mock.Anything, "1.2.3.4").
+	// 	Return([]byte(`{"test":"ok"}`), nil).
+	// 	Once()
+
+	dlc := make(chan *domain.Event, 1)
+	batchChan := make(chan *domain.Event, 1)
+	worker := &EnricherWorker{
+		id:                           1,
+		dataEnricher:                 me,
+		jobChan:                      make(chan *domain.Event),
+		deadLetterChan:               dlc,
+		batchChan:                    batchChan,
+		workerPool:                   make(chan *EnricherWorker, 1),
+		enricherWorkerTickerDuration: time.Duration(20 * time.Millisecond),
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	ctx, cancel := context.WithCancel(context.Background())
+	go worker.DataEnricherProcess(ctx, &wg)
+
+	time.AfterFunc(50*time.Millisecond, func() {
+		cancel()
+	})
+
+	wg.Wait()
+	close(worker.jobChan)
+	close(worker.workerPool)
+
+	assert.Error(t, context.Cause(ctx), context.Canceled)
+	me.AssertExpectations(t)
+
+}
+
 func TestWorker_ExecuteSafely_RecoverFromPanic(t *testing.T) {
 
 	me := new(MockEnricher)
