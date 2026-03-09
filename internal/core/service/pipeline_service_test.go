@@ -106,7 +106,7 @@ func TestPipelineService_StoreWithRetry_attempCtxCancelled(t *testing.T) {
 	case e := <-service.deadLetterChan:
 		t.Logf("main context status : %s", context.Cause(service.mainCtx))
 		t.Logf("event error reason : %s", e.ErrorReason)
-		if e.ID != dummyEvent.ID && e.ErrorReason == "pipeline_store_attemptCtx_closed" {
+		if e.ErrorReason != "pipeline_store_attemptCtx_closed" {
 			t.Errorf("Expected to receive event in DLC with id : '%s', got : %s", dummyEvent.ID.String(), e.ID.String())
 		}
 		t.Logf("Successfully receive id in DLC '%s'", e.ID.String())
@@ -149,7 +149,7 @@ func TestPipelineService_StoreWithRetry_ctxCancelled(t *testing.T) {
 	case e := <-service.deadLetterChan:
 		t.Logf("main context status : %s", context.Cause(service.mainCtx))
 		t.Logf("event error reason : %s", e.ErrorReason)
-		if e.ID != dummyEvent.ID && e.ErrorReason == "storeWithRetry_mechanism_interrupted" {
+		if e.ErrorReason != "pipeline_store_with_retry_closed" {
 			t.Errorf("Expected to receive event in DLC with id : '%s', got : %s", dummyEvent.ID.String(), e.ID.String())
 		}
 		t.Logf("Successfully receive id in DLC '%s'", e.ID.String())
@@ -238,7 +238,7 @@ func TestPipelineService_JobDistributor_RoutesEvent(t *testing.T) {
 
 }
 
-func TestPipelineService_AssignWorker_AssignEvent(t *testing.T) {
+func TestPipelineService_AssignWorker_NormalFlow(t *testing.T) {
 	s := &PipelineService{
 		pipelineJobChan: make(chan *domain.Event, 1),
 		workerPoolChan:  make(chan *EnricherWorker, 1),
@@ -265,6 +265,66 @@ func TestPipelineService_AssignWorker_AssignEvent(t *testing.T) {
 			t.Errorf("Expected to receive event id : %s, but receive something else", event.ID.String())
 		}
 		t.Logf("Successfully assignWorker with event id : %s", e.ID.String())
+	case <-time.After(1 * time.Second):
+		t.Errorf("Timeout ")
+	}
+
+}
+
+func TestPipelineService_AssignWorker_CtxCancelled_WaitingWorker(t *testing.T) {
+	s := &PipelineService{
+		pipelineJobChan: make(chan *domain.Event, 1),
+		// intentionally set workerPoolChan as unbuffered channel to trigger blocking
+		workerPoolChan: make(chan *EnricherWorker),
+		deadLetterChan: make(chan *domain.Event, 1),
+	}
+	event := &domain.Event{ID: uuid.New()}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	s.assignWorker(ctx, event)
+
+	select {
+	case e := <-s.deadLetterChan:
+		if e.ErrorReason != "get_worker_failed_context_closed" {
+			t.Errorf("Expected to receive event id : %s, but receive something else", event.ID.String())
+			return
+		}
+		t.Logf("Successfully receive event from DLC with id : %s and error reason : %s", e.ID.String(), e.ErrorReason)
+	case <-time.After(1 * time.Second):
+		t.Errorf("Timeout ")
+	}
+}
+
+func TestPipelineService_AssignWorker_CtxCancelled_AssignJob(t *testing.T) {
+	s := &PipelineService{
+		pipelineJobChan: make(chan *domain.Event, 1),
+		workerPoolChan:  make(chan *EnricherWorker, 1),
+		deadLetterChan:  make(chan *domain.Event, 1),
+	}
+	event := &domain.Event{ID: uuid.New()}
+
+	dummyWorkerId := 123
+	dummyWorker := &EnricherWorker{
+		id:      dummyWorkerId,
+		jobChan: make(chan *domain.Event),
+	}
+	s.workerPoolChan <- dummyWorker
+
+	ctx, cancel := context.WithCancel(context.Background())
+	// intentionally trigger cancel after 70ms to ensure assignWorker reach worker assign job
+	time.AfterFunc(70*time.Millisecond, func() {
+		cancel()
+	})
+	s.assignWorker(ctx, event)
+
+	select {
+	case e := <-s.deadLetterChan:
+		if e.ErrorReason != "assign_worker_job_failed_context_closed" {
+			t.Errorf("Expected to receive event error reason : assign_worker_job_failed_context_closed, but receive something else")
+			return
+		}
+		t.Logf("Successfully receive event from DLC with id : %s and error reason : %s", e.ID.String(), e.ErrorReason)
 	case <-time.After(1 * time.Second):
 		t.Errorf("Timeout ")
 	}
