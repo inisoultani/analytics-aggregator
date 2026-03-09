@@ -38,6 +38,7 @@ type PipelineService struct {
 	backoffMulitplier         time.Duration
 	batchInsertTickerDuration time.Duration
 	enricherWorkerDuration    time.Duration
+	storeTimeDuration         time.Duration
 }
 
 func NewPipelineService(ctx context.Context, txManager port.TxManager, de port.DataEnricher, cfg *config.Config) *PipelineService {
@@ -56,6 +57,7 @@ func NewPipelineService(ctx context.Context, txManager port.TxManager, de port.D
 		backoffMulitplier:         cfg.BackoffMulitplier,
 		batchInsertTickerDuration: time.Duration(3 * time.Second),
 		enricherWorkerDuration:    time.Duration(5 * time.Second),
+		storeTimeDuration:         time.Duration(100 * time.Millisecond),
 	}
 }
 
@@ -109,7 +111,7 @@ func (p *PipelineService) storeWithRetry(ctx context.Context, e *domain.Event, w
 
 	for e.RetryCount < 3 {
 
-		attempCtx, cancelAttempt := context.WithTimeout(ctx, 100*time.Millisecond)
+		attempCtx, cancelAttempt := context.WithTimeout(ctx, p.storeTimeDuration)
 		select {
 		case p.pipelineJobChan <- e:
 			cancelAttempt()
@@ -145,7 +147,7 @@ func (p *PipelineService) storeWithRetry(ctx context.Context, e *domain.Event, w
 				slog.Any("err", domain.ErrFailedToPushToPipeline))
 			continue
 		case <-ctx.Done():
-			slog.Debug("storeWithRetry mechanism interrupted",
+			slog.Debug("storeWithRetry_mechanism_interrupted",
 				slog.String("event_id", e.ID.String()),
 				slog.Int("retry_count", e.RetryCount),
 				slog.Any("err", context.Cause(ctx)))

@@ -16,86 +16,6 @@ import (
 	"github.com/stretchr/testify/suite"
 )
 
-type MockEnricher struct {
-	mock.Mock
-}
-
-func (m *MockEnricher) EnrichIp(ctx context.Context, ip string) ([]byte, error) {
-	// panic("intended issue during api call - unit test")
-	args := m.Called(ctx, ip)
-	return args.Get(0).([]byte), args.Error(1)
-}
-
-func TestWorker_DataEnricherProcess_NormalFlow(t *testing.T) {
-	me := new(MockEnricher)
-	me.On("EnrichIp", mock.Anything, "1.2.3.4").
-		Return([]byte(`{"test":"ok"}`), nil).
-		Once()
-
-	dlc := make(chan *domain.Event, 1)
-	batchChan := make(chan *domain.Event, 1)
-	worker := &EnricherWorker{
-		id:                           1,
-		dataEnricher:                 me,
-		jobChan:                      make(chan *domain.Event, 1),
-		deadLetterChan:               dlc,
-		batchChan:                    batchChan,
-		workerPool:                   make(chan *EnricherWorker, 1),
-		enricherWorkerTickerDuration: time.Duration(1 * time.Second),
-	}
-
-	eventId := uuid.New()
-	worker.jobChan <- &domain.Event{ID: eventId, ClientIP: "1.2.3.4"}
-
-	var wg sync.WaitGroup
-	wg.Add(1)
-	ctx, cancel := context.WithCancel(context.Background())
-	go worker.DataEnricherProcess(ctx, &wg)
-
-	select {
-	case event := <-batchChan:
-		assert.Equal(t, eventId, event.ID)
-	case <-time.After(1 * time.Second):
-		t.Fatal("Time out during waiting for panic event in batch channel")
-	}
-
-	cancel()
-	wg.Wait()
-	close(worker.jobChan)
-	close(worker.workerPool)
-
-	me.AssertExpectations(t)
-
-}
-
-func TestWorker_ExecuteSafely_RecoverFromPanic(t *testing.T) {
-
-	me := new(MockEnricher)
-	me.On("EnrichIp", mock.Anything, "1.2.3.4").
-		Panic("intended issue during api call - unit test").
-		Once()
-
-	dlc := make(chan *domain.Event, 1)
-	worker := &EnricherWorker{
-		id:             1,
-		dataEnricher:   me,
-		deadLetterChan: dlc,
-	}
-
-	e := &domain.Event{ID: uuid.New(), ClientIP: "1.2.3.4"}
-	worker.enriceWithPanicHandling(context.Background(), e)
-
-	select {
-	case panicEvent := <-dlc:
-		if panicEvent.ErrorReason == "" {
-			t.Errorf("Expected ErrorReason to be filled, got empty string instead")
-		}
-		t.Logf("Successfully captured error reason : %s", panicEvent.ErrorReason)
-	case <-time.After(1 * time.Second):
-		t.Fatal("Time out during waiting for panic event in DLC")
-	}
-}
-
 func TestPipelineService_Start_Stop(t *testing.T) {
 
 	cfg, err := config.Load()
@@ -159,6 +79,86 @@ func TestPipelineService_StoreWithRetry_NormalFlow(t *testing.T) {
 	}
 	cancelMainCtx()
 	wg.Wait()
+}
+
+func TestPipelineService_StoreWithRetry_attempCtxCancelled(t *testing.T) {
+	cfg := &config.Config{
+		EnricherWorkerSize: 1,
+		// intentionally set channel size to 0,
+		// so that the channel will backpressure since no consumer listen to this channel
+		PipelineJobSize: 0,
+		InsertBatchSize: 1,
+		// this is to ensure that the retry will not spent more 12 milliseconds instead 12 second
+		BackoffMulitplier: time.Second,
+	}
+
+	dummyEvent := &domain.Event{ID: uuid.New()}
+	mainCtx, cancelMainCtx := context.WithCancel(context.Background())
+	service := NewPipelineService(mainCtx, nil, &MockEnricher{}, cfg)
+
+	// trigger context cancelled so the event will sent to DLE instead
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go service.storeWithRetry(mainCtx, dummyEvent, &wg)
+	cancelMainCtx()
+	select {
+	case e := <-service.deadLetterChan:
+		t.Logf("main context status : %s", context.Cause(service.mainCtx))
+		t.Logf("event error reason : %s", e.ErrorReason)
+		if e.ID != dummyEvent.ID && e.ErrorReason == "pipeline_store_attemptCtx_closed" {
+			t.Errorf("Expected to receive event in DLC with id : '%s', got : %s", dummyEvent.ID.String(), e.ID.String())
+		}
+		t.Logf("Successfully receive id in DLC '%s'", e.ID.String())
+	case <-time.After(1 * time.Second):
+		t.Fatal("Time out during waiting for dead letter event")
+	}
+
+	wg.Wait()
+
+}
+
+func TestPipelineService_StoreWithRetry_ctxCancelled(t *testing.T) {
+	cfg := &config.Config{
+		EnricherWorkerSize: 1,
+		// intentionally set channel size to 0,
+		// so that the channel will backpressure since no consumer listen to this channel
+		PipelineJobSize: 0,
+		InsertBatchSize: 1,
+		// this is to ensure that the retry will take longer and ctx.Done triggered first
+		BackoffMulitplier: time.Second,
+	}
+
+	dummyEvent := &domain.Event{ID: uuid.New()}
+	mainCtx, cancelMainCtx := context.WithCancel(context.Background())
+	service := NewPipelineService(mainCtx, nil, &MockEnricher{}, cfg)
+
+	// set service storeTimeDuration to 50ms so that we can trigger ctxCanceled after that
+	service.storeTimeDuration = time.Duration(50 * time.Millisecond)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go service.storeWithRetry(mainCtx, dummyEvent, &wg)
+
+	// trigger cancel only after first attempt context deadline exceeded
+	time.AfterFunc(70*time.Millisecond, func() {
+		cancelMainCtx()
+	})
+
+	select {
+	case e := <-service.deadLetterChan:
+		t.Logf("main context status : %s", context.Cause(service.mainCtx))
+		t.Logf("event error reason : %s", e.ErrorReason)
+		if e.ID != dummyEvent.ID && e.ErrorReason == "storeWithRetry_mechanism_interrupted" {
+			t.Errorf("Expected to receive event in DLC with id : '%s', got : %s", dummyEvent.ID.String(), e.ID.String())
+		}
+		t.Logf("Successfully receive id in DLC '%s'", e.ID.String())
+	case <-time.After(1 * time.Second):
+		t.Fatal("Time out during waiting for dead letter event")
+	}
+
+	wg.Wait()
+
 }
 
 func TestPipelineService_StoreWithRetry_BackpressureMaxRetries(t *testing.T) {
@@ -491,4 +491,84 @@ func (s *TestPipelineSuite) TestPipelineService_insertDeadLetterEvents() {
 
 func TestExampleSuite(t *testing.T) {
 	suite.Run(t, new(TestPipelineSuite))
+}
+
+type MockEnricher struct {
+	mock.Mock
+}
+
+func (m *MockEnricher) EnrichIp(ctx context.Context, ip string) ([]byte, error) {
+	// panic("intended issue during api call - unit test")
+	args := m.Called(ctx, ip)
+	return args.Get(0).([]byte), args.Error(1)
+}
+
+func TestWorker_DataEnricherProcess_NormalFlow(t *testing.T) {
+	me := new(MockEnricher)
+	me.On("EnrichIp", mock.Anything, "1.2.3.4").
+		Return([]byte(`{"test":"ok"}`), nil).
+		Once()
+
+	dlc := make(chan *domain.Event, 1)
+	batchChan := make(chan *domain.Event, 1)
+	worker := &EnricherWorker{
+		id:                           1,
+		dataEnricher:                 me,
+		jobChan:                      make(chan *domain.Event, 1),
+		deadLetterChan:               dlc,
+		batchChan:                    batchChan,
+		workerPool:                   make(chan *EnricherWorker, 1),
+		enricherWorkerTickerDuration: time.Duration(1 * time.Second),
+	}
+
+	eventId := uuid.New()
+	worker.jobChan <- &domain.Event{ID: eventId, ClientIP: "1.2.3.4"}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	ctx, cancel := context.WithCancel(context.Background())
+	go worker.DataEnricherProcess(ctx, &wg)
+
+	select {
+	case event := <-batchChan:
+		assert.Equal(t, eventId, event.ID)
+	case <-time.After(1 * time.Second):
+		t.Fatal("Time out during waiting for panic event in batch channel")
+	}
+
+	cancel()
+	wg.Wait()
+	close(worker.jobChan)
+	close(worker.workerPool)
+
+	me.AssertExpectations(t)
+
+}
+
+func TestWorker_ExecuteSafely_RecoverFromPanic(t *testing.T) {
+
+	me := new(MockEnricher)
+	me.On("EnrichIp", mock.Anything, "1.2.3.4").
+		Panic("intended issue during api call - unit test").
+		Once()
+
+	dlc := make(chan *domain.Event, 1)
+	worker := &EnricherWorker{
+		id:             1,
+		dataEnricher:   me,
+		deadLetterChan: dlc,
+	}
+
+	e := &domain.Event{ID: uuid.New(), ClientIP: "1.2.3.4"}
+	worker.enriceWithPanicHandling(context.Background(), e)
+
+	select {
+	case panicEvent := <-dlc:
+		if panicEvent.ErrorReason == "" {
+			t.Errorf("Expected ErrorReason to be filled, got empty string instead")
+		}
+		t.Logf("Successfully captured error reason : %s", panicEvent.ErrorReason)
+	case <-time.After(1 * time.Second):
+		t.Fatal("Time out during waiting for panic event in DLC")
+	}
 }
