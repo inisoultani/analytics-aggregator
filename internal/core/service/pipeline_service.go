@@ -74,6 +74,7 @@ func (p *PipelineService) Open(ctx context.Context) {
 			workerPool:                   p.workerPoolChan,
 			deadLetterChan:               p.deadLetterChan,
 			enricherWorkerTickerDuration: p.enricherWorkerDuration,
+			backoffMultiplier:            time.Second,
 		}
 		p.enrichWorkerList = append(p.enrichWorkerList, w)
 		p.wgWorker.Add(1)
@@ -392,10 +393,11 @@ type EnricherWorker struct {
 	jobChan                      chan *domain.Event
 	dataEnricher                 port.DataEnricher
 	cancelFunc                   context.CancelCauseFunc
-	batchChan                    chan<- *domain.Event
-	workerPool                   chan<- *EnricherWorker
-	deadLetterChan               chan<- *domain.Event
+	batchChan                    chan *domain.Event
+	workerPool                   chan *EnricherWorker
+	deadLetterChan               chan *domain.Event
 	enricherWorkerTickerDuration time.Duration
+	backoffMultiplier            time.Duration
 }
 
 func (e *EnricherWorker) DataEnricherProcess(ctx context.Context, wg *sync.WaitGroup) {
@@ -485,10 +487,10 @@ func (e *EnricherWorker) enrichWithRetry(ctx context.Context, event *domain.Even
 		event.RetryCount = 0
 		for event.RetryCount < 3 {
 			event.RetryCount++
-			retryDuration := time.Duration(event.RetryCount*2) * time.Second
+			retryDuration := time.Duration(event.RetryCount*2) * e.backoffMultiplier
 			select {
 			case <-ctx.Done():
-				msg := "EnrichWithRetry mechanism interrupted"
+				msg := "EnrichWithRetry_mechanism_interrupted"
 				slog.Debug(msg,
 					slog.String("event_id", event.ID.String()),
 					slog.Int("retry_count", event.RetryCount),
@@ -514,7 +516,7 @@ func (e *EnricherWorker) enrichWithRetry(ctx context.Context, event *domain.Even
 			slog.Int("retry_count", event.RetryCount),
 			slog.Any("err", err),
 		)
-		event.ErrorReason = err.Error()
+		event.ErrorReason = "EnrichWithRetry_reach_max_attempt"
 		sendToDLE(ctx, event, "enricher_worker", e.deadLetterChan)
 	}
 

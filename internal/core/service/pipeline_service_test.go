@@ -5,6 +5,7 @@ import (
 	"analytics-aggregator/internal/core/domain"
 	"analytics-aggregator/internal/core/port"
 	"context"
+	"errors"
 	"log/slog"
 	"sync"
 	"testing"
@@ -607,9 +608,6 @@ func TestWorker_DataEnricherProcess_NormalFlow(t *testing.T) {
 
 func TestWorker_DataEnricherProcess_Sleep_And_CtxCancelled(t *testing.T) {
 	me := new(MockEnricher)
-	// me.On("EnrichIp", mock.Anything, "1.2.3.4").
-	// 	Return([]byte(`{"test":"ok"}`), nil).
-	// 	Once()
 
 	dlc := make(chan *domain.Event, 1)
 	batchChan := make(chan *domain.Event, 1)
@@ -632,6 +630,50 @@ func TestWorker_DataEnricherProcess_Sleep_And_CtxCancelled(t *testing.T) {
 		cancel()
 	})
 
+	wg.Wait()
+	close(worker.jobChan)
+	close(worker.workerPool)
+
+	assert.Error(t, context.Cause(ctx), context.Canceled)
+	me.AssertExpectations(t)
+
+}
+
+func TestWorker_DataEnricherProcess_Retry_MaxAttempts(t *testing.T) {
+	me := new(MockEnricher)
+	me.On("EnrichIp", mock.Anything, "1.2.3.4").
+		Return([]byte{}, errors.New("intended error - unit test")).Times(4)
+
+	dlc := make(chan *domain.Event, 1)
+	batchChan := make(chan *domain.Event, 1)
+	worker := &EnricherWorker{
+		id:                           1,
+		dataEnricher:                 me,
+		jobChan:                      make(chan *domain.Event),
+		deadLetterChan:               dlc,
+		batchChan:                    batchChan,
+		workerPool:                   make(chan *EnricherWorker, 1),
+		enricherWorkerTickerDuration: time.Duration(20 * time.Millisecond),
+		backoffMultiplier:            time.Millisecond,
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	ctx, cancel := context.WithCancel(context.Background())
+	go worker.DataEnricherProcess(ctx, &wg)
+
+	worker.jobChan <- &domain.Event{ID: uuid.New(), ClientIP: "1.2.3.4"}
+
+	select {
+	case e := <-worker.deadLetterChan:
+		if e.ErrorReason != "EnrichWithRetry_reach_max_attempt" {
+			t.Errorf("Expected error reason EnrichWithRetry_reach_max_attempt, but receive something else ")
+		}
+	case <-time.After(1 * time.Second):
+		t.Errorf("Timeout waiting for event from DLC")
+	}
+
+	cancel()
 	wg.Wait()
 	close(worker.jobChan)
 	close(worker.workerPool)
