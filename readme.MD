@@ -71,3 +71,10 @@ The codebase is strictly organized following Ports and Adapters to ensure the co
 ├── go.mod
 └── go.sum
 ```
+
+
+## Development & Contributing
+
+Before picking up a ticket or opening a Pull Request, all engineers **must** read and follow our development standards:
+
+* 📖 **[Engineering Standard: Testing Workflow & SDLC](./TESTING.md)**: Learn how to write technical ACs, generate test skeletons, and pass our CI pipeline coverage gates.
