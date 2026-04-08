@@ -115,6 +115,8 @@ func TestPipelineService_StoreWithRetry(t *testing.T) {
 			}
 
 			mainCtx, cancelMainCtx := context.WithCancel(context.Background())
+			defer cancelMainCtx()
+
 			service := NewPipelineService(mainCtx, nil, &MockEnricher{}, cfg)
 			service.storeTimeDuration = 50 * time.Millisecond
 
