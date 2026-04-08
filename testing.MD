@@ -154,3 +154,28 @@ When reviewing a peer's code, follow this exact order:
 
 ---
 *By following this workflow, we ensure our code remains resilient, our CI pipelines stay green, and our engineers spend their time solving hard problems—not chasing bugs in production.*
+
+---
+
+## Phase 5: Handling Legacy Code (The Boy Scout Rule)
+
+You will frequently need to update older, untested areas of the codebase. When this happens, we strictly adhere to the **Boy Scout Rule**: *Leave the code better than you found it, but do not try to clean the whole forest.*
+
+* **Do NOT "Boil the Ocean":** If you are fixing a 2-line bug in a 1,000-line legacy package that has 0% coverage, you are **not** expected to write tests for the entire package. 
+* **Your Responsibility:** You are only required to write a table-driven unit test for the *specific logic you are touching or adding*. 
+* **The Goal:** Over time, as we touch legacy code naturally through feature work and bug fixes, the coverage will organically rise without bringing feature velocity to a halt.
+
+---
+
+## Phase 6: Measuring Success & Metrics
+
+To ensure this workflow is actively helping the team and not just adding bureaucratic overhead, Engineering Leadership tracks the following metrics. If you notice these metrics degrading, raise it in retro so we can adjust the process.
+
+### Quality Metrics
+1. **Escaped Defect Rate:** The volume of bugs reported in production that originated from newly written, post-standardized code. *Goal: A sharp downward trend.*
+2. **Rollback Rate:** The percentage of deployments that require an immediate rollback or hotfix. *Goal: < 2%.*
+
+### Velocity & Friction Metrics
+3. **PR Cycle Time (Lead Time for Changes):** The time from the first commit to PR merge. *Goal: While this may initially spike during onboarding, clear test tables should ultimately reduce review back-and-forth, dropping cycle time.*
+4. **Test Flakiness Rate:** The percentage of CI runs that fail and then pass on a direct retry without code changes. *Goal: Zero tolerance. Flaky integration tests destroy developer trust and must be quarantined immediately.*
+5. **CI Execution Time (P95):** The time it takes for the test suite to run in the CI pipeline. *Goal: < 5 minutes. If this creeps up, we must aggressively enforce `t.Parallel()` in unit tests and optimize our Testcontainers setup.*
